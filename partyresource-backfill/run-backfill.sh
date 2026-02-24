@@ -67,7 +67,14 @@ while true; do
   row="$(psql_cmd -At -F '|' -c "
     SELECT
       \"AllCompleted\",
-      \"ProcessedRows\"
+      \"ProcessedRows\",
+      \"SelectBatchMs\",
+      \"ParseMs\",
+      \"InsertPartyMs\",
+      \"InsertResourceMs\",
+      \"InsertPairMs\",
+      \"UpdateStateMs\",
+      \"TotalMs\"
     FROM partyresource.backfill_dialog_partyresource_batch(${current_batch_size});
   ")"
   batch_finished_epoch="$(date +%s)"
@@ -77,12 +84,20 @@ while true; do
     exit 1
   fi
 
-  IFS='|' read -r completed processed <<< "$row"
+  IFS='|' read -r completed processed select_batch_ms parse_ms insert_party_ms insert_resource_ms insert_pair_ms update_state_ms total_ms <<< "$row"
 
   if [[ ! "$processed" =~ ^[0-9]+$ ]]; then
     echo "invalid ProcessedRows value from backfill function: $processed" >&2
     exit 1
   fi
+
+  for timing_name in select_batch_ms parse_ms insert_party_ms insert_resource_ms insert_pair_ms update_state_ms total_ms; do
+    timing_value="${!timing_name}"
+    if [[ ! "$timing_value" =~ ^[0-9]+$ ]]; then
+      echo "invalid timing value from backfill function: ${timing_name}=${timing_value}" >&2
+      exit 1
+    fi
+  done
 
   total_rows=$((total_rows + processed))
 
@@ -104,6 +119,11 @@ while true; do
         current_batch_size="$MAX_BATCH_SIZE"
       fi
     fi
+  fi
+
+  if [[ "$VERBOSE" == "1" ]]; then
+    echo "batch processed=${processed} completed=${completed} query_seconds=${batch_elapsed} batch_size=${current_batch_size}"
+    echo "timing_ms select_batch=${select_batch_ms} parse=${parse_ms} insert_party=${insert_party_ms} insert_resource=${insert_resource_ms} insert_pair=${insert_pair_ms} update_state=${update_state_ms} total=${total_ms}"
   fi
 
   now="$(date +%s)"
