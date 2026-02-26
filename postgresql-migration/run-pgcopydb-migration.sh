@@ -12,6 +12,9 @@ set -euo pipefail
 #   export TARGET_PASSWORD='...'
 #   ./run-pgcopydb-migration.sh start
 #
+#   # explicit resume mode (same as start with START_FRESH=false and --resume):
+#   ./run-pgcopydb-migration.sh resume
+#
 #   # later, at cutover:
 #   ./run-pgcopydb-migration.sh cutover
 #
@@ -48,6 +51,7 @@ SPLIT_TABLES_LARGER_THAN="${SPLIT_TABLES_LARGER_THAN:-10GB}"
 DROP_IF_EXISTS="${DROP_IF_EXISTS:-false}"
 OUTPUT_PLUGIN="${OUTPUT_PLUGIN:-}"
 START_FRESH="${START_FRESH:-true}"
+USE_RESUME="${USE_RESUME:-auto}"
 COPY_ROLES="${COPY_ROLES:-false}"
 COPY_ROLE_PASSWORDS="${COPY_ROLE_PASSWORDS:-false}"
 EXTRA_CLONE_ARGS="${EXTRA_CLONE_ARGS:-}"
@@ -137,6 +141,7 @@ print_config() {
   echo "  DROP_IF_EXISTS=${DROP_IF_EXISTS}"
   echo "  OUTPUT_PLUGIN=${OUTPUT_PLUGIN:-<default>}"
   echo "  START_FRESH=${START_FRESH}"
+  echo "  USE_RESUME=${USE_RESUME}"
   echo "  COPY_ROLES=${COPY_ROLES}"
   echo "  COPY_ROLE_PASSWORDS=${COPY_ROLE_PASSWORDS}"
   echo "  EXTRA_CLONE_ARGS=${EXTRA_CLONE_ARGS:-<none>}"
@@ -182,6 +187,11 @@ do_start() {
     cmd+=(--drop-if-exists)
   fi
 
+  # For interrupted runs, pgcopydb expects explicit --resume to continue safely.
+  if [[ "$USE_RESUME" == "true" ]] || [[ "$USE_RESUME" == "auto" && "$START_FRESH" != "true" ]]; then
+    cmd+=(--resume)
+  fi
+
   if [[ -n "$OUTPUT_PLUGIN" ]]; then
     cmd+=(--plugin "$OUTPUT_PLUGIN")
   fi
@@ -223,9 +233,18 @@ do_cleanup() {
   pgcopydb stream cleanup --source "$SOURCE_PGURI" --target "$TARGET_PGURI" --dir "$WORK_DIR"
 }
 
+do_resume() {
+  START_FRESH="false"
+  USE_RESUME="true"
+  do_start
+}
+
 case "$ACTION" in
   start)
     do_start
+    ;;
+  resume)
+    do_resume
     ;;
   status)
     do_status
@@ -237,7 +256,7 @@ case "$ACTION" in
     do_cleanup
     ;;
   *)
-    echo "Usage: $0 {start|status|cutover|cleanup}" >&2
+    echo "Usage: $0 {start|resume|status|cutover|cleanup}" >&2
     exit 2
     ;;
 esac

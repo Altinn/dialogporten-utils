@@ -64,14 +64,23 @@ Notes:
 
 ### 2) Resume after interruption
 
+Preferred:
+
+```bash
+./run-pgcopydb-migration.sh resume
+```
+
+Equivalent manual mode:
+
 ```bash
 export START_FRESH=false
+export USE_RESUME=true
 export DROP_IF_EXISTS=false
 ./run-pgcopydb-migration.sh start
 ```
 
 Notes:
-- Reuses existing workdir and replication state.
+- Resume reuses existing workdir/replication state and runs `pgcopydb clone --follow --resume`.
 - Do **not** run `cleanup` before resume.
 
 ### 3) Check status (separate shell)
@@ -90,7 +99,7 @@ At cutover time:
 ./run-pgcopydb-migration.sh cutover
 ```
 
-Then wait for the running `start` process to drain/apply and exit.
+Then wait for the running `start`/`resume` process to drain/apply and exit.
 
 ### 5) Cleanup after successful migration
 
