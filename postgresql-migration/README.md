@@ -116,3 +116,30 @@ Use cleanup only after successful switchover (or when intentionally discarding r
 - Monitor source WAL retention while catch-up runs.
 - Logical replication does not synchronize sequence state automatically; reconcile sequences on target before reopening writes.
 - Keep source available for rollback during agreed validation window.
+
+## Key Vault connection string updates
+
+Use `update-keyvault-connection-strings.sh` to inspect and update the two Dialogporten DB secrets in the environment key vault:
+- `dialogportenAdoConnectionString`
+- `dialogportenPsqlConnectionString`
+
+The script derives environment and key vault from server naming convention (`dp-be-<env>-...`) and updates both secrets in one command.
+
+### Show current secret versions/host
+
+```bash
+./update-keyvault-connection-strings.sh show <target-server-name>
+```
+
+### Update both secrets
+
+```bash
+./update-keyvault-connection-strings.sh update <target-server-name> <db-user> <db-password>
+```
+
+Example:
+
+```bash
+./update-keyvault-connection-strings.sh show dp-be-test-postgres-i7se3jtjey3lo-v2
+./update-keyvault-connection-strings.sh update dp-be-test-postgres-i7se3jtjey3lo-v2 dialogportenPgAdmin '***'
+```
