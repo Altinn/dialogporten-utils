@@ -150,6 +150,11 @@ Options:
                           - postgres: PostgreSQL Flexible Server (default port: $DEFAULT_POSTGRES_PORT)
                           - redis:    Redis Cache (default port: $DEFAULT_REDIS_PORT)
 
+    -n, --name NAME       Override resource base name for selected type/environment
+                          - postgres hostname: NAME.postgres.database.azure.com
+                          - redis hostname:    NAME.redis.cache.windows.net
+                          The specified resource must exist in the selected environment
+
     -p, --port PORT       Local port to bind on localhost (127.0.0.1)
                           If not specified, will use the default port for the selected database
 
@@ -171,6 +176,9 @@ Examples:
     # Connect to Redis in prod with custom local port
     $0 -e prod -t redis -p 6380
     $0 --environment prod --type redis --port 6380
+
+    # Connect to a specific named postgres server
+    $0 -e test -t postgres -n foobar
 
 Troubleshooting:
     If the script hangs or times out, it might be due to Azure CLI upgrade prompts.
@@ -226,6 +234,17 @@ validate_port() {
     fi
 
     return 0
+}
+
+# Validate that an option has a value
+require_option_value() {
+    local option_name=$1
+    local value=${2:-}
+
+    if [ -z "$value" ] || [[ "$value" == -* ]]; then
+        log_error "Option ${option_name} requires a value"
+        exit 1
+    fi
 }
 
 # =========================================================================
@@ -413,11 +432,37 @@ EOF
 get_postgres_info() {
     local env=$1
     local subscription_id=$2
+    local name_override=${3:-}
 
     log_info "Fetching PostgreSQL server information..."
     local name
-    name=$(az postgres flexible-server list --subscription "$subscription_id" \
-        --query "[?tags.Environment=='$env' && tags.Product=='$PRODUCT_TAG'] | [0].name" -o tsv)
+    local username
+
+    if [ -n "$name_override" ]; then
+        name="$name_override"
+        if ! username=$(az postgres flexible-server show \
+            --subscription "$subscription_id" \
+            --resource-group "$(get_resource_group "$env")" \
+            --name "$name" \
+            --query "administratorLogin" -o tsv 2>/dev/null); then
+            log_error "Postgres server '$name' was not found in environment '$env'"
+            exit 1
+        fi
+    else
+        name=$(az postgres flexible-server list --subscription "$subscription_id" \
+            --query "[?tags.Environment=='$env' && tags.Product=='$PRODUCT_TAG'] | [0].name" -o tsv)
+
+        if [ -z "$name" ]; then
+            log_error "Postgres server not found"
+            exit 1
+        fi
+
+        username=$(az postgres flexible-server show \
+            --subscription "$subscription_id" \
+            --resource-group "$(get_resource_group "$env")" \
+            --name "$name" \
+            --query "administratorLogin" -o tsv)
+    fi
 
     if [ -z "$name" ]; then
         log_error "Postgres server not found"
@@ -426,12 +471,6 @@ get_postgres_info() {
 
     local hostname="${name}.postgres.database.azure.com"
     local port=$DEFAULT_POSTGRES_PORT
-
-    local username
-    username=$(az postgres flexible-server show \
-        --resource-group "$(get_resource_group "$env")" \
-        --name "$name" \
-        --query "administratorLogin" -o tsv)
 
     echo "name=$name"
     echo "hostname=$hostname"
@@ -443,11 +482,25 @@ get_postgres_info() {
 get_redis_info() {
     local env=$1
     local subscription_id=$2
+    local name_override=${3:-}
 
     log_info "Fetching Redis server information..."
     local name
-    name=$(az redis list --subscription "$subscription_id" \
-        --query "[?tags.Environment=='$env' && tags.Product=='$PRODUCT_TAG'] | [0].name" -o tsv)
+
+    if [ -n "$name_override" ]; then
+        name="$name_override"
+        if ! az redis show \
+            --subscription "$subscription_id" \
+            --resource-group "$(get_resource_group "$env")" \
+            --name "$name" \
+            --query "name" -o tsv >/dev/null 2>&1; then
+            log_error "Redis server '$name' was not found in environment '$env'"
+            exit 1
+        fi
+    else
+        name=$(az redis list --subscription "$subscription_id" \
+            --query "[?tags.Environment=='$env' && tags.Product=='$PRODUCT_TAG'] | [0].name" -o tsv)
+    fi
 
     if [ -z "$name" ]; then
         log_error "Redis server not found"
@@ -507,6 +560,7 @@ main() {
     local environment=$1
     local db_type=$2
     local local_port=$3
+    local name_override=${4:-}
 
     # Add trap to handle script termination
     trap 'echo -e "\n${YELLOW}⚠${NC} Operation interrupted"; exit 130' INT TERM
@@ -549,6 +603,7 @@ main() {
     print_box "Configuration" "\
 Environment: ${BOLD}${CYAN}${environment}${NC}
 Database:    ${BOLD}${YELLOW}${db_type}${NC}
+Name:        ${BOLD}${name_override:-"<auto-discover>"}${NC}
 Local Port:  ${BOLD}${local_port:-"<default>"}${NC}"
 
     read -rp "Proceed? (y/N) " confirm
@@ -567,9 +622,9 @@ Local Port:  ${BOLD}${local_port:-"<default>"}${NC}"
     # Get database information based on database type
     local resource_info
     if [ "$db_type" = "postgres" ]; then
-        resource_info=$(get_postgres_info "$environment" "$subscription_id")
+        resource_info=$(get_postgres_info "$environment" "$subscription_id" "$name_override")
     else
-        resource_info=$(get_redis_info "$environment" "$subscription_id")
+        resource_info=$(get_redis_info "$environment" "$subscription_id" "$name_override")
     fi
 
     # Parse the resource information
@@ -612,19 +667,28 @@ ${BOLD}${connection_string/localhost/$'\n'localhost}${NC}"
 environment=""
 db_type=""
 local_port=""
+name_override=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -e|--environment)
+            require_option_value "$1" "${2:-}"
             environment="$2"
             shift 2
             ;;
         -t|--type)
+            require_option_value "$1" "${2:-}"
             db_type="$2"
             shift 2
             ;;
+        -n|--name)
+            require_option_value "$1" "${2:-}"
+            name_override="$2"
+            shift 2
+            ;;
         -p|--port)
+            require_option_value "$1" "${2:-}"
             local_port="$2"
             shift 2
             ;;
@@ -645,4 +709,4 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Call main with all arguments
-main "${environment:-}" "${db_type:-}" "${local_port:-}"
+main "${environment:-}" "${db_type:-}" "${local_port:-}" "${name_override:-}"

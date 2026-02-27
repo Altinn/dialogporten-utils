@@ -49,9 +49,10 @@ INDEX_JOBS="${INDEX_JOBS:-4}"
 RESTORE_JOBS="${RESTORE_JOBS:-4}"
 SPLIT_TABLES_LARGER_THAN="${SPLIT_TABLES_LARGER_THAN:-10GB}"
 DROP_IF_EXISTS="${DROP_IF_EXISTS:-false}"
-OUTPUT_PLUGIN="${OUTPUT_PLUGIN:-}"
+OUTPUT_PLUGIN="${OUTPUT_PLUGIN:-wal2json}"
 START_FRESH="${START_FRESH:-true}"
 USE_RESUME="${USE_RESUME:-auto}"
+RESUME_NOT_CONSISTENT="${RESUME_NOT_CONSISTENT:-true}"
 COPY_ROLES="${COPY_ROLES:-false}"
 COPY_ROLE_PASSWORDS="${COPY_ROLE_PASSWORDS:-false}"
 EXTRA_CLONE_ARGS="${EXTRA_CLONE_ARGS:-}"
@@ -139,9 +140,10 @@ print_config() {
   echo "  RESTORE_JOBS=${RESTORE_JOBS}"
   echo "  SPLIT_TABLES_LARGER_THAN=${SPLIT_TABLES_LARGER_THAN}"
   echo "  DROP_IF_EXISTS=${DROP_IF_EXISTS}"
-  echo "  OUTPUT_PLUGIN=${OUTPUT_PLUGIN:-<default>}"
+  echo "  OUTPUT_PLUGIN=${OUTPUT_PLUGIN}"
   echo "  START_FRESH=${START_FRESH}"
   echo "  USE_RESUME=${USE_RESUME}"
+  echo "  RESUME_NOT_CONSISTENT=${RESUME_NOT_CONSISTENT}"
   echo "  COPY_ROLES=${COPY_ROLES}"
   echo "  COPY_ROLE_PASSWORDS=${COPY_ROLE_PASSWORDS}"
   echo "  EXTRA_CLONE_ARGS=${EXTRA_CLONE_ARGS:-<none>}"
@@ -190,6 +192,9 @@ do_start() {
   # For interrupted runs, pgcopydb expects explicit --resume to continue safely.
   if [[ "$USE_RESUME" == "true" ]] || [[ "$USE_RESUME" == "auto" && "$START_FRESH" != "true" ]]; then
     cmd+=(--resume)
+    if [[ "$RESUME_NOT_CONSISTENT" == "true" ]]; then
+      cmd+=(--not-consistent)
+    fi
   fi
 
   if [[ -n "$OUTPUT_PLUGIN" ]]; then
