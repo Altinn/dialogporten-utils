@@ -3,11 +3,10 @@ set -euo pipefail
 
 # pgcopydb migration helper for Azure PostgreSQL Flexible Server.
 #
-# Defaults are set for:
-#   source: dp-be-test-postgres-i7se3jtjey3lo
-#   target: dp-be-test-postgres-i7se3jtjey3lo-v2
-#
+
 # Usage:
+#   export SOURCE_SERVER='dp-be-test-xxxx'
+#   export TARGET_SERVER='dp-be-test-xxxx-v2'
 #   export SOURCE_PASSWORD='...'
 #   export TARGET_PASSWORD='...'
 #   ./run-pgcopydb-migration.sh start
@@ -18,7 +17,7 @@ set -euo pipefail
 #   # later, at cutover:
 #   ./run-pgcopydb-migration.sh cutover
 #
-#   # inspect replication sentinel status:
+#   # inspect replication sentinel status
 #   ./run-pgcopydb-migration.sh status
 #
 #   # cleanup slot/origin/sentinel artifacts after completion:
@@ -26,8 +25,8 @@ set -euo pipefail
 
 ACTION="${1:-start}"
 
-SOURCE_SERVER="${SOURCE_SERVER:-dp-be-test-postgres-i7se3jtjey3lo}"
-TARGET_SERVER="${TARGET_SERVER:-dp-be-test-postgres-i7se3jtjey3lo-v2}"
+SOURCE_SERVER="${SOURCE_SERVER:-}"
+TARGET_SERVER="${TARGET_SERVER:-}"
 
 SOURCE_HOST="${SOURCE_HOST:-${SOURCE_SERVER}.postgres.database.azure.com}"
 TARGET_HOST="${TARGET_HOST:-${TARGET_SERVER}.postgres.database.azure.com}"
@@ -152,6 +151,8 @@ print_config() {
 setup_common() {
   require_cmd pgcopydb
   require_cmd psql
+  require_non_empty "SOURCE_SERVER" "${SOURCE_SERVER:-}"
+  require_non_empty "TARGET_SERVER" "${TARGET_SERVER:-}"
   require_non_empty "SOURCE_PASSWORD" "${SOURCE_PASSWORD:-}"
   require_non_empty "TARGET_PASSWORD" "${TARGET_PASSWORD:-}"
   write_pgpass
