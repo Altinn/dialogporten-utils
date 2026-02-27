@@ -5,6 +5,9 @@ This folder contains the operational script used to migrate Azure PostgreSQL Fle
 ## Files
 
 - `run-pgcopydb-migration.sh`: migration helper script (base copy + logical catch-up + cutover helpers).
+- `cae-apps-parallel.sh`: parallel stop/start for all Container Apps in one CAE.
+- `cae-jobs-parallel.sh`: parallel pause/resume for scheduled Container App Jobs.
+- `update-keyvault-connection-strings.sh`: get/update Key Vault DB connection string secrets.
 
 ## Where to run
 
@@ -152,4 +155,31 @@ Example:
   --server dp-be-test-postgresql-xxxx \
   --username dialogportenPgAdmin \
   --password '***'
+```
+
+## Scheduled Container App Jobs
+
+`cae-apps-parallel.sh` does not control Container App Jobs. Use `cae-jobs-parallel.sh` to pause/resume scheduled jobs during cutover.
+
+### Pause scheduled jobs before cutover
+
+```bash
+./cae-jobs-parallel.sh pause <resource-group> --parallelism 10
+```
+
+Default behavior:
+- Stores each job's original cron expression in tag `pgMigrationOriginalCron`.
+- Sets a temporary pause cron (`0 0 1 1 *` by default).
+- Stops currently running job executions.
+
+### Resume scheduled jobs after cutover
+
+```bash
+./cae-jobs-parallel.sh resume <resource-group> --parallelism 10
+```
+
+### Inspect job pause/resume status
+
+```bash
+./cae-jobs-parallel.sh status <resource-group>
 ```

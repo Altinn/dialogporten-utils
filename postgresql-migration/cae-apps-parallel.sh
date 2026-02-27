@@ -12,7 +12,7 @@ set -euo pipefail
 #   ./cae-apps-parallel.sh start dp-be-test-rg dp-be-test-cae
 #   ./cae-apps-parallel.sh start dp-be-test-rg dp-be-test-cae --revision abc123
 #   ./cae-apps-parallel.sh start dp-be-test-rg dp-be-test-cae --revision '{app}--abc123'
-#   ./cae-apps-parallel.sh start dp-be-test-rg dp-be-test-cae --parallelism 10
+#   ./cae-apps-parallel.sh start dp-be-test-rg dp-be-test-cae --parallelism 20
 
 require_cmd() {
   local cmd="$1"
@@ -46,7 +46,7 @@ ENV_NAME="$3"
 shift 3
 
 REVISION=""
-PARALLELISM="${PARALLELISM:-6}"
+PARALLELISM="${PARALLELISM:-12}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
