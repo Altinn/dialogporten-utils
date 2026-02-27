@@ -123,23 +123,33 @@ Use `update-keyvault-connection-strings.sh` to inspect and update the two Dialog
 - `dialogportenAdoConnectionString`
 - `dialogportenPsqlConnectionString`
 
-The script derives environment and key vault from server naming convention (`dp-be-<env>-...`) and updates both secrets in one command.
+The script resolves the single key vault in the provided resource group.
 
-### Show current secret versions/host
+### Get current secret values
 
 ```bash
-./update-keyvault-connection-strings.sh show <target-server-name>
+./update-keyvault-connection-strings.sh get --resource-group <rg>
 ```
 
 ### Update both secrets
 
+The script prints the exact values it will write and asks for confirmation before overwriting.
+
 ```bash
-./update-keyvault-connection-strings.sh update <target-server-name> <db-user> <db-password>
+./update-keyvault-connection-strings.sh update \
+  --resource-group <rg> \
+  --server <server-name> \
+  --username <db-user> \
+  --password <db-password>
 ```
 
 Example:
 
 ```bash
-./update-keyvault-connection-strings.sh show dp-be-test-postgres-i7se3jtjey3lo-v2
-./update-keyvault-connection-strings.sh update dp-be-test-postgres-i7se3jtjey3lo-v2 dialogportenPgAdmin '***'
+./update-keyvault-connection-strings.sh get --resource-group dp-be-test-rg
+./update-keyvault-connection-strings.sh update \
+  --resource-group dp-be-test-rg \
+  --server dp-be-test-postgresql-xxxx \
+  --username dialogportenPgAdmin \
+  --password '***'
 ```
