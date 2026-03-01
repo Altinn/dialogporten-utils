@@ -44,13 +44,12 @@ export TARGET_PASSWORD='...'
 Optional common overrides:
 
 ```bash
-export SOURCE_SERVER='dp-be-test-postgres-i7se3jtjey3lo'
-export TARGET_SERVER='dp-be-test-postgres-i7se3jtjey3lo-v2'
+export SOURCE_SERVER='dp-be-test-postgres-xxxx'
+export TARGET_SERVER='dp-be-test-postgres2-xxxx'
 export SOURCE_DB='dialogporten'
 export TARGET_DB='dialogporten'
 export SOURCE_USER='dialogportenPgAdmin'
 export TARGET_USER='dialogportenPgAdmin'
-export OUTPUT_PLUGIN='wal2json'
 ```
 
 ### 1) Start / initial load + follow
@@ -164,7 +163,7 @@ Example:
 ### Pause scheduled jobs before cutover
 
 ```bash
-./cae-jobs-parallel.sh pause <resource-group> --parallelism 10
+./cae-jobs-parallel.sh pause <resource-group> 
 ```
 
 Default behavior:
@@ -175,7 +174,7 @@ Default behavior:
 ### Resume scheduled jobs after cutover
 
 ```bash
-./cae-jobs-parallel.sh resume <resource-group> --parallelism 10
+./cae-jobs-parallel.sh resume <resource-group>
 ```
 
 ### Inspect job pause/resume status
