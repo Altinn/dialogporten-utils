@@ -3,7 +3,7 @@
 
 Behavior:
 - Reads SQL files from a directory (default: sql/)
-- Replaces "$party" placeholder with randomized values from parties.txt
+- Replaces "$party" placeholder with randomized values from the configured parties file
 - Executes each SQL N times with psql using:
     EXPLAIN (ANALYZE, BUFFERS, TIMING, FORMAT JSON)
 - Stores per-run output under output/<timestamp>/
@@ -25,6 +25,7 @@ import re
 import statistics
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -39,8 +40,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dbname", required=True, help="Database name")
     parser.add_argument("--user", required=True, help="Database user")
     parser.add_argument("--runs", required=True, type=int, help="Runs per SQL file")
+    parser.add_argument(
+        "--design",
+        choices=["paired", "random"],
+        default="paired",
+        help="Benchmark design: paired (same party per round for all SQLs) or random (independent party per SQL run)",
+    )
+    parser.add_argument(
+        "--order-mode",
+        choices=["alternate", "random"],
+        default="alternate",
+        help="Variant order inside each round when using paired design",
+    )
     parser.add_argument("--sql-dir", default="sql", help="Directory containing .sql files")
-    parser.add_argument("--parties-file", default="parties.txt", help="Newline-separated party values")
+    parser.add_argument("--parties-file", default="benchmark_parties.txt", help="Newline-separated party values")
     parser.add_argument("--output-dir", default="output", help="Output root directory")
     parser.add_argument("--seed", type=int, help="Optional random seed")
     return parser.parse_args()
@@ -95,10 +108,10 @@ def load_parties(path: Path) -> list[str]:
     with path.open("r", encoding="utf-8") as f:
         raw = [line.strip() for line in f if line.strip()]
 
-    # Deduplicate values so the no-consecutive rule is guaranteed by value.
+    # Deduplicate values so the no-consecutive rule can be enforced by value.
     unique = list(dict.fromkeys(raw))
     if len(unique) < 2:
-        raise ValueError("parties.txt must contain at least 2 distinct non-empty values")
+        raise ValueError("Party file must contain at least 2 distinct non-empty values")
 
     return unique
 
@@ -132,6 +145,24 @@ def choose_party(rng: random.Random, parties: list[str], previous: str | None) -
     while party == previous:
         party = rng.choice(parties)
     return party
+
+
+def order_jobs_for_round(
+    sql_jobs: list[tuple[str, Path, str]],
+    *,
+    iteration: int,
+    order_mode: str,
+    rng: random.Random,
+) -> list[tuple[str, Path, str]]:
+    jobs = list(sql_jobs)
+    if order_mode == "random":
+        rng.shuffle(jobs)
+        return jobs
+
+    # alternate: for two variants this gives ABAB / BABA by round.
+    if iteration % 2 == 0:
+        jobs.reverse()
+    return jobs
 
 
 def build_query(sql_text: str, party: str) -> str:
@@ -186,6 +217,13 @@ def fmt_number(value: float | None) -> str:
     if value is None:
         return "-"
     return f"{value:.2f}"
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, sec = divmod(int(seconds), 60)
+    return f"{minutes}m{sec:02d}s"
 
 
 def build_markdown_table(rows: list[dict[str, Any]]) -> str:
@@ -275,6 +313,12 @@ def main() -> int:
     run_root = Path(args.output_dir) / utc_timestamp()
     run_root.mkdir(parents=True, exist_ok=False)
 
+    total_runs = args.runs * len(sql_jobs)
+    print(
+        f"Starting benchmark: design={args.design} order_mode={args.order_mode} "
+        f"runs_per_sql={args.runs} sql_variants={len(sql_jobs)} total_runs={total_runs}"
+    )
+
     write_json(
         run_root / "manifest.json",
         {
@@ -284,6 +328,8 @@ def main() -> int:
             "dbname": args.dbname,
             "user": args.user,
             "runs_per_sql": args.runs,
+            "design": args.design,
+            "order_mode": args.order_mode,
             "sql_dir": str(Path(args.sql_dir)),
             "parties_file": str(Path(args.parties_file)),
             "seed": args.seed,
@@ -302,18 +348,45 @@ def main() -> int:
 
     global_run_index = 0
     previous_party: str | None = None
+    completed_runs = 0
+    suite_started_at = time.perf_counter()
 
     with rows_path.open("w", encoding="utf-8") as rows_file:
         for iteration in range(1, args.runs + 1):
-            jobs_this_round = list(sql_jobs)
-            rng.shuffle(jobs_this_round)
+            if args.design == "paired":
+                party_for_round = choose_party(rng, parties, previous_party)
+                previous_party = party_for_round
+                jobs_this_round = order_jobs_for_round(
+                    sql_jobs,
+                    iteration=iteration,
+                    order_mode=args.order_mode,
+                    rng=rng,
+                )
+                order_label = ",".join(job[0] for job in jobs_this_round)
+                print(f"[round {iteration}/{args.runs}] party={party_for_round} order={order_label}")
+            else:
+                party_for_round = None
+                jobs_this_round = order_jobs_for_round(
+                    sql_jobs,
+                    iteration=iteration,
+                    order_mode="random",
+                    rng=rng,
+                )
 
-            for sql_id, sql_file, sql_text in jobs_this_round:
+            for position_in_round, (sql_id, sql_file, sql_text) in enumerate(jobs_this_round, start=1):
                 global_run_index += 1
-                party = choose_party(rng, parties, previous_party)
-                previous_party = party
+
+                if args.design == "paired":
+                    party = party_for_round
+                else:
+                    party = choose_party(rng, parties, previous_party)
+                    previous_party = party
+
+                if party is None:
+                    raise RuntimeError("party must not be None")
 
                 query = build_query(sql_text, party)
+                wall_started_at = time.perf_counter()
                 completed = run_psql(
                     query,
                     host=args.host,
@@ -321,6 +394,7 @@ def main() -> int:
                     dbname=args.dbname,
                     user=args.user,
                 )
+                wall_ms = (time.perf_counter() - wall_started_at) * 1000.0
 
                 sql_run_dir = run_root / "runs" / sql_id
                 run_tag = f"run_{iteration:04d}"
@@ -331,11 +405,14 @@ def main() -> int:
                 record: dict[str, Any] = {
                     "global_run_index": global_run_index,
                     "iteration": iteration,
+                    "position_in_round": position_in_round,
+                    "design": args.design,
                     "sql_id": sql_id,
                     "sql_file": str(sql_file),
                     "party": party,
                     "success": False,
                     "returncode": completed.returncode,
+                    "wall_time_ms": round2(wall_ms),
                     "execution_time_ms": None,
                     "error": None,
                 }
@@ -357,12 +434,31 @@ def main() -> int:
 
                 rows_file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+                completed_runs += 1
+                elapsed = time.perf_counter() - suite_started_at
+                remaining = total_runs - completed_runs
+                rate = completed_runs / elapsed if elapsed > 0 else 0.0
+                eta = remaining / rate if rate > 0 else 0.0
+                progress_pct = (completed_runs / total_runs) * 100.0
+                exec_ms = round2(record["execution_time_ms"]) if record["execution_time_ms"] is not None else None
+                status = "ok" if record["success"] else "fail"
+
+                print(
+                    f"[progress {completed_runs}/{total_runs} {progress_pct:5.1f}%] "
+                    f"round={iteration}/{args.runs} pos={position_in_round}/{len(jobs_this_round)} "
+                    f"sql={sql_id} status={status} exec_ms={fmt_number(exec_ms)} "
+                    f"elapsed={format_duration(elapsed)} eta={format_duration(eta)}"
+                )
+                sys.stdout.flush()
+
     summary: dict[str, Any] = {
         "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "run_root": str(run_root),
         "runs_per_sql": args.runs,
+        "design": args.design,
+        "order_mode": args.order_mode,
         "sql": {},
-        "total_runs": args.runs * len(sql_jobs),
+        "total_runs": total_runs,
     }
 
     csv_rows: list[dict[str, Any]] = []

@@ -1,0 +1,64 @@
+You are a PostgreSQL performance analysis agent.
+
+Task:
+Analyze benchmark results under:
+/Users/bjorn/repos/dialogporten-utils/dialogsearch-benchmark/endusercontext-search/output/20260305T170825Z
+
+Scope:
+1. Read and analyze:
+   - summary.json
+   - summary.md
+   - runs.jsonl
+   - all files matching runs/*/*.explain.json
+
+2. There are two SQL variants in this run. Compare them rigorously.
+
+Required output:
+1. Executive summary
+   - Which SQL is better overall and by how much.
+   - Whether differences are statistically meaningful from the observed distributions.
+
+2. Metrics comparison table
+   - For each SQL: count_success, count_failures, avg_ms, p50_ms, p95_ms, p99_ms, min_ms, max_ms.
+   - Include absolute and percentage deltas between the two SQLs.
+
+3. Tail behavior analysis
+   - Explain why p95/p99 differ (or not).
+   - Identify outlier runs from runs.jsonl and corresponding explain files.
+   - Call out whether variability is likely data-dependent, cache/I/O-dependent, or plan instability.
+
+4. EXPLAIN plan analysis per SQL
+   - Describe plan shape (top-level nodes and critical inner nodes).
+   - Compare representative fast, median, and slow run plans for each SQL.
+   - For each representative plan include:
+     - file path
+     - Execution Time
+     - dominant expensive node(s)
+     - row estimates vs actual rows where relevant
+     - buffer behavior (hits vs reads when visible)
+
+5. Root-cause assessment
+   - Most likely bottlenecks in production-scale data (hundreds of millions of relevant rows).
+   - Whether bottlenecks are due to sort/order, join strategy, index usage/selectivity, lateral aggregation, or cardinality misestimation.
+
+6. Concrete recommendations
+   - Query-level changes (if any).
+   - Index recommendations with explicit index definitions (CREATE INDEX statements) where justified.
+   - Statistics/config recommendations (e.g., ANALYZE targets) only if evidence supports it.
+   - Validation plan: exact follow-up measurements to confirm improvements.
+
+Evidence and citation requirements:
+- Every technical claim must cite one or more concrete files from the run directory.
+- Use absolute file paths.
+- Include enough detail to be auditable, but keep the final report concise.
+
+Output format:
+- Markdown
+- Sections:
+  1) Overall Result
+  2) Metrics
+  3) Plan Comparison
+  4) Outliers and Tail Latency
+  5) Bottlenecks
+  6) Recommendations
+  7) Evidence (file list)
