@@ -9,18 +9,18 @@ The setup is designed to reduce variance from party-level data skew by:
 
 ## Files
 
-- `sql/`:
+- `sql/`
   - SQL variants (`*.sql`) to benchmark.
   - Each SQL must contain the placeholder `$party`.
-- `parties.txt`:
+- `parties.txt`
   - Large party pool (one party per line).
-- `benchmark_parties.txt`:
+- `benchmark_parties.txt`
   - Fixed sampled party set for benchmarking (generated).
-- `build_party_benchmark_set.py`:
-  - Generates `benchmark_parties.txt` from `parties.txt` using DB counts.
-- `bench_sql.py`:
+- `build_party_benchmark_set.py`
+  - Generates `benchmark_parties.txt` from `parties.txt`.
+- `bench_sql.py`
   - Runs SQL benchmarks and writes run artifacts/summary.
-- `output/`:
+- `output/`
   - Timestamped benchmark run outputs.
 
 ## Requirements
@@ -36,51 +36,73 @@ No password argument is supported by scripts.
 
 Use this once (or occasionally) to produce a stable, representative party sample.
 
+### Recommended safe command (prod)
+
 ```bash
 python3 build_party_benchmark_set.py \
   --host <host> \
   --port <port> \
   --dbname <db> \
-  --user <user> \
+  --user <readonly_user> \
   --parties-file parties.txt \
   --sample-size 2000 \
   --strategy stratified \
   --allocation balanced \
   --count-mode batched-selects \
-  --batch-size 200 \
-  --pause-ms 50 \
-  --statement-timeout-ms 30000 \
+  --count-cap 10001 \
+  --batch-size 50 \
+  --min-batch-size 1 \
+  --pause-ms 100 \
+  --statement-timeout-ms 120000 \
+  --resume \
+  --state-file benchmark_parties.state.json \
+  --checkpoint-interval 500 \
   --seed 1337 \
   --output-parties-file benchmark_parties.txt \
   --output-prefix benchmark_parties
 ```
 
-### What it does
+### Count modes
 
-Count modes:
-- `batched-selects` (default): many smaller SELECTs, safer for prod and works with SELECT-only users.
-- `temp-table`: faster in some environments, but uses temp table/COPY and is not SELECT-only.
+- `batched-selects` (default)
+  - Uses many smaller `SELECT` statements.
+  - Works with SELECT-only users.
+  - Supports timeout split retry and resume.
+- `temp-table`
+  - Uses temp table + COPY.
+  - Can be faster in some environments.
+  - Not SELECT-only.
 
-- Loads all parties from `parties.txt`.
-- By default runs many smaller batched `SELECT` queries to compute dialog counts using `Dialog` (works with a SELECT-only user).
-- Assigns strata by count:
-  - `0`
-  - `1-10`
-  - `11-100`
-  - `101-1000`
-  - `1001-10000`
-  - `10001+`
-- Samples parties (default: `stratified` + `balanced`).
-- Writes:
-  - `benchmark_parties.txt` (one party per line)
-  - `benchmark_parties.csv` (sampled set with counts/strata)
-  - `benchmark_parties.party_counts.csv` (full pool counts)
-  - `benchmark_parties.strata_summary.csv`
-  - `benchmark_parties.metadata.json`
+### Timeout hardening (batched-selects)
+
+- `--count-cap 10001`
+  - Counts at most 10001 rows per party, which is enough for the `10001+` stratum.
+  - Prevents hot parties from forcing very long scans.
+- `--retry-on-timeout` (default on)
+  - If a batch times out, script splits it into smaller batches.
+- `--timeout-single-party-as-top-stratum` (default on)
+  - If a single party still times out, it is assigned `count_cap`.
+- `--resume` + `--state-file`
+  - Resumes long runs after interruption/failure.
+
+### Optional load reduction
+
+- `--max-parties-to-count N`
+  - Deterministically pre-sample candidate parties before counting.
+  - Useful if full pool is very large.
+
+### What the generator writes
+
+- `benchmark_parties.txt` (one party per line)
+- `benchmark_parties.csv` (sampled set with counts/strata)
+- `benchmark_parties.party_counts.csv` (counted candidate pool)
+- `benchmark_parties.strata_summary.csv`
+- `benchmark_parties.metadata.json`
+- `benchmark_parties.state.json` (when using resume/checkpoint)
 
 ## 2) Run Benchmark
 
-`bench_sql.py` now defaults to `benchmark_parties.txt`.
+`bench_sql.py` defaults to `benchmark_parties.txt`.
 
 ```bash
 python3 bench_sql.py \
@@ -102,32 +124,32 @@ python3 bench_sql.py ... --parties-file some_other_parties.txt
 
 ### Benchmark design options
 
-- `--design paired` (default, recommended):
+- `--design paired` (default, recommended)
   - One party selected per round, then all SQL variants run for that same party.
   - Greatly improves fairness across variants.
-- `--design random`:
+- `--design random`
   - Independent random party per SQL run.
   - Higher variance.
 
-- `--order-mode alternate` (default):
-  - Alternates variant order each round (helps reduce order bias).
-- `--order-mode random`:
+- `--order-mode alternate` (default)
+  - Alternates variant order each round.
+- `--order-mode random`
   - Random order each round.
 
 ### Runtime progress output
 
-While running, script prints:
+`bench_sql.py` prints:
 - benchmark start summary,
 - per-round party + variant order (paired mode),
-- per-run progress with `%`, round/position, sql id, status, execution time, elapsed, ETA.
+- per-run progress with `%`, round/position, SQL id, status, execution time, elapsed, ETA.
 
 ## Output Structure
 
 Each run writes to `output/<timestamp>/`:
 
-- `manifest.json`:
+- `manifest.json`
   - run config (db args, design/order mode, seed, files)
-- `runs.jsonl`:
+- `runs.jsonl`
   - one record per SQL execution
 - `runs/<sql_id>/run_XXXX.stdout.txt`
 - `runs/<sql_id>/run_XXXX.stderr.txt`
@@ -136,57 +158,56 @@ Each run writes to `output/<timestamp>/`:
 - `summary.csv`
 - `summary.md`
 
-The script prints:
-- output folder path,
-- markdown filename/path,
-- ASCII summary table.
+The script also prints an ASCII summary table.
 
 ## Statistical Recommendations
 
 For production benchmarking with skewed party distributions:
 
-1. Generate a fixed party sample (`benchmark_parties.txt`) and reuse it across comparisons.
-2. Use `--design paired`.
-3. Use `--order-mode alternate` (or `random`).
-4. Keep seed fixed for reproducibility when comparing query variants.
-5. Compare variants across repeated full runs; inspect p50/p95/p99 and run-level outliers.
+1. Generate and reuse a fixed party sample (`benchmark_parties.txt`).
+2. Use `--design paired` in `bench_sql.py`.
+3. Use `--order-mode alternate` (or random).
+4. Keep seed fixed when comparing query variants.
+5. Compare p50/p95/p99 and inspect outlier explains.
 
 ## SQL Requirements
 
 - SQL files must be in `sql/*.sql`.
 - Each file must contain `$party` placeholder.
-- `$party` is SQL-escaped by the benchmark script before execution.
+- `$party` is SQL-escaped by benchmark script before execution.
 
 ## Common Issues
 
-- `psql` exits non-zero:
-  - check `.pgpass` credentials and DB connectivity.
-- Missing placeholder error:
-  - ensure each SQL has `$party`.
-- Too-small party file:
-  - benchmark requires at least 2 distinct parties.
-- Highly variable tails:
-  - increase sampled party set and/or run count, keep paired design.
+- `psql` exits non-zero
+  - Check `.pgpass`, DNS/connectivity, and SSL requirements.
+- `statement timeout` during party generation
+  - Lower `--batch-size`, increase `--statement-timeout-ms`, keep `--retry-on-timeout`, and enable `--resume`.
+- Missing placeholder error
+  - Ensure each SQL includes `$party`.
+- Too-small party file
+  - Benchmark requires at least 2 distinct parties.
 
 ## Example End-to-End
 
 ```bash
-# Build stable party sample from the large pool
+# 1) Build stable party sample
 python3 build_party_benchmark_set.py \
   --host prod-db \
   --port 5432 \
   --dbname appdb \
-  --user bench \
+  --user readonly_user \
   --sample-size 2000 \
   --strategy stratified \
   --allocation balanced \
   --count-mode batched-selects \
-  --batch-size 200 \
-  --pause-ms 50 \
-  --statement-timeout-ms 30000 \
+  --count-cap 10001 \
+  --batch-size 50 \
+  --pause-ms 100 \
+  --statement-timeout-ms 120000 \
+  --resume \
   --seed 1337
 
-# Run benchmark for all SQL variants in sql/
+# 2) Run SQL benchmark variants
 python3 bench_sql.py \
   --host prod-db \
   --port 5432 \
