@@ -129,6 +129,66 @@ prompt_selection() {
     done
 }
 
+# Show an interactive selection prompt with default support
+# Usage: select_from_list "Resource Type" "name1\nname2\nname3"
+# Echoes the selected name. Defaults to the shortest name (base name without suffix).
+select_from_list() {
+    local resource_label=$1
+    local names=$2
+
+    # Sort and build array, tracking shortest name as default
+    local sorted_names
+    sorted_names=$(echo "$names" | sed '/^$/d' | sort)
+
+    local servers=()
+    local default_name=""
+    while IFS= read -r server_name; do
+        if [ -z "$default_name" ] || [ ${#server_name} -lt ${#default_name} ]; then
+            default_name="$server_name"
+        fi
+        servers+=("$server_name")
+    done <<< "$sorted_names"
+
+    # Single match — return directly
+    if [ "${#servers[@]}" -le 1 ]; then
+        echo "${servers[0]}"
+        return
+    fi
+
+    # Multiple matches — prompt for selection
+    log_warning "Multiple ${resource_label} servers found:" >&2
+    log_info "Default: ${BOLD}${default_name}${NC}" >&2
+    echo "" >&2
+    local i=1
+    for server_name in "${servers[@]}"; do
+        if [ "$server_name" = "$default_name" ]; then
+            echo -e "  ${GREEN}${i})${NC} ${BOLD}${server_name}${NC} (default)" >&2
+        else
+            echo -e "  ${i}) ${server_name}" >&2
+        fi
+        ((i++))
+    done
+    echo "" >&2
+
+    local selection
+    while true; do
+        read -rp "Select server (1-${#servers[@]}) [default: ${default_name}]: " selection
+
+        if [ -z "$selection" ]; then
+            log_success "Selected server: ${default_name}" >&2
+            echo "$default_name"
+            return
+        elif [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "${#servers[@]}" ]; then
+            local selected="${servers[$((selection - 1))]}"
+            log_success "Selected server: ${selected}" >&2
+            echo "$selected"
+            return
+        else
+            log_error "Invalid selection: $selection. Please try again." >&2
+        fi
+    done
+}
+
 # Show help message
 print_help() {
     cat << EOF
@@ -428,44 +488,49 @@ EOF
 # Database Functions
 # =========================================================================
 
+# Discover available servers and let the user pick if multiple exist.
+# Echoes the selected server name.
+discover_server() {
+    local db_type=$1
+    local env=$2
+    local subscription_id=$3
+
+    local all_names
+    if [ "$db_type" = "postgres" ]; then
+        log_info "Discovering PostgreSQL servers..." >&2
+        all_names=$(az postgres flexible-server list --subscription "$subscription_id" \
+            --query "[?tags.Environment=='$env' && tags.Product=='$PRODUCT_TAG'].name" -o tsv)
+    else
+        log_info "Discovering Redis servers..." >&2
+        all_names=$(az redis list --subscription "$subscription_id" \
+            --query "[?tags.Environment=='$env' && tags.Product=='$PRODUCT_TAG'].name" -o tsv)
+    fi
+
+    if [ -z "$all_names" ]; then
+        log_error "No ${db_type} server found in environment '${env}'"
+        exit 1
+    fi
+
+    local label
+    label=$([[ "$db_type" == "postgres" ]] && echo "PostgreSQL" || echo "Redis")
+    select_from_list "$label" "$all_names"
+}
+
 # Get PostgreSQL server information
 get_postgres_info() {
     local env=$1
     local subscription_id=$2
-    local name_override=${3:-}
+    local name=$3
 
     log_info "Fetching PostgreSQL server information..."
-    local name
     local username
 
-    if [ -n "$name_override" ]; then
-        name="$name_override"
-        if ! username=$(az postgres flexible-server show \
-            --subscription "$subscription_id" \
-            --resource-group "$(get_resource_group "$env")" \
-            --name "$name" \
-            --query "administratorLogin" -o tsv 2>/dev/null); then
-            log_error "Postgres server '$name' was not found in environment '$env'"
-            exit 1
-        fi
-    else
-        name=$(az postgres flexible-server list --subscription "$subscription_id" \
-            --query "[?tags.Environment=='$env' && tags.Product=='$PRODUCT_TAG'] | [0].name" -o tsv)
-
-        if [ -z "$name" ]; then
-            log_error "Postgres server not found"
-            exit 1
-        fi
-
-        username=$(az postgres flexible-server show \
-            --subscription "$subscription_id" \
-            --resource-group "$(get_resource_group "$env")" \
-            --name "$name" \
-            --query "administratorLogin" -o tsv)
-    fi
-
-    if [ -z "$name" ]; then
-        log_error "Postgres server not found"
+    if ! username=$(az postgres flexible-server show \
+        --subscription "$subscription_id" \
+        --resource-group "$(get_resource_group "$env")" \
+        --name "$name" \
+        --query "administratorLogin" -o tsv 2>/dev/null); then
+        log_error "Postgres server '$name' was not found in environment '$env'"
         exit 1
     fi
 
@@ -482,28 +547,16 @@ get_postgres_info() {
 get_redis_info() {
     local env=$1
     local subscription_id=$2
-    local name_override=${3:-}
+    local name=$3
 
     log_info "Fetching Redis server information..."
-    local name
 
-    if [ -n "$name_override" ]; then
-        name="$name_override"
-        if ! az redis show \
-            --subscription "$subscription_id" \
-            --resource-group "$(get_resource_group "$env")" \
-            --name "$name" \
-            --query "name" -o tsv >/dev/null 2>&1; then
-            log_error "Redis server '$name' was not found in environment '$env'"
-            exit 1
-        fi
-    else
-        name=$(az redis list --subscription "$subscription_id" \
-            --query "[?tags.Environment=='$env' && tags.Product=='$PRODUCT_TAG'] | [0].name" -o tsv)
-    fi
-
-    if [ -z "$name" ]; then
-        log_error "Redis server not found"
+    if ! az redis show \
+        --subscription "$subscription_id" \
+        --resource-group "$(get_resource_group "$env")" \
+        --name "$name" \
+        --query "name" -o tsv >/dev/null 2>&1; then
+        log_error "Redis server '$name' was not found in environment '$env'"
         exit 1
     fi
 
@@ -599,11 +652,22 @@ main() {
         validate_port "$local_port" || exit 1
     fi
 
+    # Resolve subscription and discover server name before showing confirmation
+    local subscription_id
+    subscription_id=$(get_subscription_id "$environment")
+    az account set --subscription "$subscription_id" >/dev/null 2>&1
+    log_success "Azure subscription set"
+
+    # Discover/select server if no explicit name was given
+    if [ -z "$name_override" ]; then
+        name_override=$(discover_server "$db_type" "$environment" "$subscription_id")
+    fi
+
     # Print confirmation
     print_box "Configuration" "\
 Environment: ${BOLD}${CYAN}${environment}${NC}
 Database:    ${BOLD}${YELLOW}${db_type}${NC}
-Name:        ${BOLD}${name_override:-"<auto-discover>"}${NC}
+Name:        ${BOLD}${name_override}${NC}
 Local Port:  ${BOLD}${local_port:-"<default>"}${NC}"
 
     read -rp "Proceed? (y/N) " confirm
@@ -613,11 +677,6 @@ Local Port:  ${BOLD}${local_port:-"<default>"}${NC}"
     fi
 
     log_info "Setting up connection for ${BOLD}${environment}${NC} environment"
-
-    local subscription_id
-    subscription_id=$(get_subscription_id "$environment")
-    az account set --subscription "$subscription_id" >/dev/null 2>&1
-    log_success "Azure subscription set"
 
     # Get database information based on database type
     local resource_info
