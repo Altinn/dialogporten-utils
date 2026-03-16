@@ -180,13 +180,13 @@ main() {
 
   if [[ "$mode" == "pause" ]]; then
     # shellcheck disable=SC2016
-    printf '%s\n' "${jobs[@]}" | xargs -P "$parallelism" -n 1 -I {} bash -c 'pause_one "$1" "$2" "$3" "$4"' _ {} "$rg" "$pause_cron" "$tag_key"
+    printf '%s\n' "${jobs[@]}" | xargs -P "$parallelism" -I {} bash -c 'pause_one "$1" "$2" "$3" "$4"' _ {} "$rg" "$pause_cron" "$tag_key"
   elif [[ "$mode" == "resume" ]]; then
     # shellcheck disable=SC2016
-    printf '%s\n' "${jobs[@]}" | xargs -P "$parallelism" -n 1 -I {} bash -c 'resume_one "$1" "$2" "$3"' _ {} "$rg" "$tag_key"
+    printf '%s\n' "${jobs[@]}" | xargs -P "$parallelism" -I {} bash -c 'resume_one "$1" "$2" "$3"' _ {} "$rg" "$tag_key"
   else
     # shellcheck disable=SC2016
-    printf '%s\n' "${jobs[@]}" | xargs -P "$parallelism" -n 1 -I {} bash -c 'status_one "$1" "$2" "$3"' _ {} "$rg" "$tag_key"
+    printf '%s\n' "${jobs[@]}" | xargs -P "$parallelism" -I {} bash -c 'status_one "$1" "$2" "$3"' _ {} "$rg" "$tag_key"
   fi
 }
 
