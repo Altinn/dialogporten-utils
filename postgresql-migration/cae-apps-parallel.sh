@@ -146,7 +146,7 @@ export RG
 export REVISION
 
 if [[ "$MODE" == "stop" ]]; then
-  printf '%s\n' "${APPS[@]}" | xargs -P "$PARALLELISM" -n 1 -I {} bash -c 'stop_one "$1" "$2"' _ {} "$RG"
+  printf '%s\n' "${APPS[@]}" | xargs -P "$PARALLELISM" -I {} bash -c 'stop_one "$1" "$2"' _ {} "$RG"
 else
-  printf '%s\n' "${APPS[@]}" | xargs -P "$PARALLELISM" -n 1 -I {} bash -c 'start_one "$1" "$2" "$3"' _ {} "$RG" "$REVISION"
+  printf '%s\n' "${APPS[@]}" | xargs -P "$PARALLELISM" -I {} bash -c 'start_one "$1" "$2" "$3"' _ {} "$RG" "$REVISION"
 fi
