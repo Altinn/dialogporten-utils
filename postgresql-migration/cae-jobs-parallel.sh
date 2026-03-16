@@ -64,7 +64,7 @@ pause_one() {
   local pause_cron="$3"
   local tag_key="$4"
 
-  local current_cron job_id
+  local current_cron saved_cron job_id
   current_cron="$(get_job_cron "$rg" "$job")"
 
   if [[ -z "$current_cron" || "$current_cron" == "None" ]]; then
@@ -72,8 +72,14 @@ pause_one() {
     return 0
   fi
 
+  saved_cron="$(get_saved_cron "$rg" "$job" "$tag_key")"
   job_id="$(get_job_id "$rg" "$job")"
-  az tag update --resource-id "$job_id" --operation Merge --tags "${tag_key}=${current_cron}" --only-show-errors >/dev/null
+
+  if [[ -n "$saved_cron" && "$saved_cron" != "None" ]]; then
+    echo "[$job] already paused (saved=${saved_cron}), keeping existing tag"
+  else
+    az tag update --resource-id "$job_id" --operation Merge --tags "${tag_key}=${current_cron}" --only-show-errors >/dev/null
+  fi
 
   az containerapp job update -g "$rg" -n "$job" --cron-expression "$pause_cron" --only-show-errors >/dev/null
   az containerapp job stop -g "$rg" -n "$job" --only-show-errors >/dev/null || true
