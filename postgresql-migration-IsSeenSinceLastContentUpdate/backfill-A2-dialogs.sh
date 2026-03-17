@@ -34,17 +34,19 @@ while true; do
     SET lock_timeout = '2s';
     SET statement_timeout = '30s';
 
-    WITH cte AS (
-      SELECT d.\"Id\"
-      FROM \"Dialog\" d
-      WHERE \"ContentUpdatedAt\" >= '2025-12-01'
-        AND \"IsSeenSinceLastContentUpdate\" = false
-        AND NOT EXISTS (
-              SEL
-              FROM \"DialogSeenLog\" s
-              WHERE d.\"Id\" = s.\"DialogId\"
-            )
-      LIMIT $BATCH_SIZE
+    WITH
+      CTE AS (
+        SELECT
+          *
+        FROM
+          \"Dialog\"
+        WHERE
+          \"Org\" = 'acn'
+          AND \"ContentUpdatedAt\" >= '2025-12-01'
+          AND \"ServiceResource\" LIKE 'urn:altinn:resource:app_acn_a2-%'
+          AND \"IsSeenSinceLastContentUpdate\" = false
+        LIMIT
+          $BATCH_SIZE
     )
     UPDATE \"Dialog\" d
     SET \"IsSeenSinceLastContentUpdate\" = true
