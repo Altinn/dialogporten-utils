@@ -1,5 +1,6 @@
 #!/bin/bash
 
+source ./backfill-get-orgs.sh
 echo "Select environment:"
 echo "1) local"
 echo "2) azure"
@@ -21,45 +22,59 @@ case $ENV in
     ;;
 esac
 
+export PGPASSFILE="./.pgpass"
+
 DATABASE_URL=localhost
 DATABASE_NAME=Dialogporten
 BATCH_SIZE=5000
-TOTAL=0
+
+TOTAL_UPDATE_COUNT=0
 SECONDS=0
 
-export PGPASSFILE="./.pgpass"
+get_orgs "$DATABASE_URL" "$DATABASE_PORT" "$DATABASE_USER" "$DATABASE_NAME"
 
-while true; do
-  UPDATED=$(psql -h $DATABASE_URL -p $DATABASE_PORT -U $DATABASE_USER -d $DATABASE_NAME -qAt -c "
-    SET lock_timeout = '2s';
-    SET statement_timeout = '30s';
+for ORG in "${ORGS[@]}"; do
+  echo ""
+  echo "=== Processing org: $ORG ==="
+  ORG_UPDATE_COUNT=0
 
-    WITH
-      CTE AS (
-        SELECT
-          *
-        FROM
-          \"Dialog\"
-        WHERE
-          \"Org\" = 'acn'
-          AND \"ContentUpdatedAt\" >= '2025-12-01'
-          AND \"ServiceResource\" LIKE 'urn:altinn:resource:app_acn_a2-%'
-          AND \"IsSeenSinceLastContentUpdate\" = false
-        LIMIT
-          $BATCH_SIZE
-    )
-    UPDATE \"Dialog\" d
-    SET \"IsSeenSinceLastContentUpdate\" = true
-    FROM cte
-    WHERE d.\"Id\" = cte.\"Id\"
-    RETURNING 1;
-  " | wc -l)
+  while true; do
+    UPDATED=$(psql -h $DATABASE_URL -p $DATABASE_PORT -U $DATABASE_USER -d $DATABASE_NAME -qAt -c "
+      SET lock_timeout = '2s';
+      SET statement_timeout = '30s';
 
-  TOTAL=$((TOTAL + UPDATED))
-  echo "Updated $UPDATED rows (total $TOTAL) - elapsed ${SECONDS}s"
+      WITH
+        CTE AS (
+          SELECT
+            \"Id\"
+          FROM
+            \"Dialog\"
+          WHERE
+            \"Org\" = '$ORG'
+            AND \"ContentUpdatedAt\" >= '2025-12-01'
+            AND \"ServiceResource\" LIKE 'urn:altinn:resource:app_${ORG}_a2-%'
+            AND \"IsSeenSinceLastContentUpdate\" = false
+          LIMIT
+            $BATCH_SIZE
+      )
+      UPDATE \"Dialog\" d
+      SET \"IsSeenSinceLastContentUpdate\" = true
+      FROM cte
+      WHERE d.\"Id\" = cte.\"Id\"
+      RETURNING 1;
+    " | wc -l)
 
-  if [ "$UPDATED" -eq 0 ]; then
-    echo "Done. Total updated $TOTAL rows in ${SECONDS}s"
-    break
-  fi
+    ORG_UPDATE_COUNT=$((ORG_UPDATE_COUNT + UPDATED))
+    TOTAL_UPDATE_COUNT=$((TOTAL_UPDATE_COUNT + UPDATED))
+
+    echo "[$ORG] Updated $UPDATED rows (total $TOTAL_UPDATE_COUNT) - elapsed ${SECONDS}s"
+
+    if [ "$UPDATED" -eq 0 ]; then
+      echo "[$ORG] Done. Total updated $ORG_UPDATE_COUNT rows in ${SECONDS}s"
+      break
+    fi
+  done
 done
+
+echo ""
+echo "All Done. Total updated $TOTAL_UPDATE_COUNT rows in ${SECONDS}s"
