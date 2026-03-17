@@ -223,7 +223,92 @@ do_start() {
 
 do_status() {
   setup_common
-  pgcopydb stream sentinel get --source "$SOURCE_PGURI" --dir "$WORK_DIR" --json || true
+
+  # --- Colors (disabled if not a terminal) ---
+  local RED GREEN YELLOW CYAN BOLD DIM NC
+  if [[ -t 1 ]]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+    CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+  else
+    RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; DIM=''; NC=''
+  fi
+
+  # --- Sentinel ---
+  local json
+  json="$(pgcopydb stream sentinel get --source "$SOURCE_PGURI" --dir "$WORK_DIR" --json 2>/dev/null)" || {
+    echo -e "${RED}No sentinel data found. Migration may not have started yet.${NC}"
+    return 0
+  }
+
+  echo -e "${BOLD}Sentinel${NC}"
+  echo "$json"
+  echo
+
+  local startpos endpos apply write_lsn flush_lsn replay_lsn
+  startpos="$(echo "$json" | grep -o '"startpos": *"[^"]*"' | cut -d'"' -f4)"
+  endpos="$(echo "$json" | grep -o '"endpos": *"[^"]*"' | cut -d'"' -f4)"
+  apply="$(echo "$json" | grep -o '"apply": *[a-z]*' | awk '{print $2}')"
+  write_lsn="$(echo "$json" | grep -o '"write_lsn": *"[^"]*"' | cut -d'"' -f4)"
+  flush_lsn="$(echo "$json" | grep -o '"flush_lsn": *"[^"]*"' | cut -d'"' -f4)"
+  replay_lsn="$(echo "$json" | grep -o '"replay_lsn": *"[^"]*"' | cut -d'"' -f4)"
+
+  # --- State ---
+  if [[ "$startpos" == "$endpos" && "$apply" == "true" ]]; then
+    echo -e "State: ${GREEN}FOLLOWING${NC} (no cutover signal set, CDC active)"
+  elif [[ "$startpos" != "$endpos" && "$replay_lsn" == "$endpos" ]]; then
+    echo -e "State: ${GREEN}CUTOVER COMPLETE${NC} (replay caught up to endpos)"
+  elif [[ "$startpos" != "$endpos" ]]; then
+    echo -e "State: ${YELLOW}DRAINING${NC} (cutover signal set, waiting for replay to catch up)"
+  else
+    echo -e "State: ${DIM}UNKNOWN${NC} (apply=$apply, startpos=$startpos, endpos=$endpos)"
+  fi
+
+  # --- LSN lag (replay vs current WAL) ---
+  echo
+  echo -e "${BOLD}Replay lag${NC}"
+  local lag_bytes lag_pretty
+  lag_bytes="$(psql "$SOURCE_PGURI" -Atqc \
+    "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '${replay_lsn}');" 2>/dev/null)" || true
+
+  if [[ -n "$lag_bytes" && "$lag_bytes" != "" ]]; then
+    lag_pretty="$(psql "$SOURCE_PGURI" -Atqc \
+      "SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), '${replay_lsn}'));" 2>/dev/null)" || true
+
+    local lag_color="$GREEN"
+    # > 1 GB = red, > 100 MB = yellow
+    if [[ "$lag_bytes" -gt 1073741824 ]]; then
+      lag_color="$RED"
+    elif [[ "$lag_bytes" -gt 104857600 ]]; then
+      lag_color="$YELLOW"
+    fi
+    echo -e "  replay_lsn → current WAL: ${lag_color}${lag_pretty}${NC} (${lag_bytes} bytes)"
+  else
+    echo -e "  ${DIM}Could not compute replay lag${NC}"
+  fi
+
+  # --- WAL retention on source ---
+  echo
+  echo -e "${BOLD}Source replication slot${NC}"
+  local slot_info
+  slot_info="$(psql "$SOURCE_PGURI" -Atqc \
+    "SELECT slot_name || ' | active=' || active || ' | retained=' || pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) || ' (' || pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) || ' bytes)' FROM pg_replication_slots WHERE slot_name = 'pgcopydb';" 2>/dev/null)" || true
+
+  if [[ -n "$slot_info" ]]; then
+    # Extract bytes for coloring
+    local wal_bytes
+    wal_bytes="$(echo "$slot_info" | grep -oP '\(\K[0-9]+')" || true
+    local wal_color="$GREEN"
+    if [[ -n "$wal_bytes" ]]; then
+      if [[ "$wal_bytes" -gt 10737418240 ]]; then  # > 10 GB
+        wal_color="$RED"
+      elif [[ "$wal_bytes" -gt 1073741824 ]]; then  # > 1 GB
+        wal_color="$YELLOW"
+      fi
+    fi
+    echo -e "  ${wal_color}${slot_info}${NC}"
+  else
+    echo -e "  ${DIM}No 'pgcopydb' replication slot found${NC}"
+  fi
 }
 
 do_cutover() {
