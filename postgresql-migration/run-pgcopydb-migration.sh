@@ -25,6 +25,18 @@ set -euo pipefail
 
 ACTION="${1:-start}"
 
+# Log all output to file on the data disk (preserving terminal colors).
+# Uses `script` to allocate a pty so pgcopydb still emits color codes.
+# The _PGMIGRATE_LOGGED guard prevents infinite re-exec.
+if [[ "$ACTION" == "start" || "$ACTION" == "resume" ]]; then
+  if [[ -z "${_PGMIGRATE_LOGGED:-}" && -n "${WORK_DIR:-}" && -d "$(dirname "$WORK_DIR")" ]]; then
+    LOG_FILE="$(dirname "$WORK_DIR")/migration-$(date +%Y%m%d-%H%M%S).log"
+    echo "Logging to: $LOG_FILE"
+    export _PGMIGRATE_LOGGED=1
+    exec script -eqfc "$(printf '%q ' "$0" "$@")" "$LOG_FILE"
+  fi
+fi
+
 SOURCE_SERVER="${SOURCE_SERVER:-}"
 TARGET_SERVER="${TARGET_SERVER:-}"
 
@@ -244,13 +256,15 @@ do_status() {
   echo "$json"
   echo
 
+  # Parse LSN values from JSON, stripping escaped forward slashes (pgcopydb
+  # outputs "16DD\/B70522E8" which breaks SQL LSN literals if not cleaned).
   local startpos endpos apply write_lsn flush_lsn replay_lsn
-  startpos="$(echo "$json" | grep -o '"startpos": *"[^"]*"' | cut -d'"' -f4)"
-  endpos="$(echo "$json" | grep -o '"endpos": *"[^"]*"' | cut -d'"' -f4)"
+  startpos="$(echo "$json" | grep -o '"startpos": *"[^"]*"' | cut -d'"' -f4 | sed 's|\\\/|/|g')"
+  endpos="$(echo "$json" | grep -o '"endpos": *"[^"]*"' | cut -d'"' -f4 | sed 's|\\\/|/|g')"
   apply="$(echo "$json" | grep -o '"apply": *[a-z]*' | awk '{print $2}')"
-  write_lsn="$(echo "$json" | grep -o '"write_lsn": *"[^"]*"' | cut -d'"' -f4)"
-  flush_lsn="$(echo "$json" | grep -o '"flush_lsn": *"[^"]*"' | cut -d'"' -f4)"
-  replay_lsn="$(echo "$json" | grep -o '"replay_lsn": *"[^"]*"' | cut -d'"' -f4)"
+  write_lsn="$(echo "$json" | grep -o '"write_lsn": *"[^"]*"' | cut -d'"' -f4 | sed 's|\\\/|/|g')"
+  flush_lsn="$(echo "$json" | grep -o '"flush_lsn": *"[^"]*"' | cut -d'"' -f4 | sed 's|\\\/|/|g')"
+  replay_lsn="$(echo "$json" | grep -o '"replay_lsn": *"[^"]*"' | cut -d'"' -f4 | sed 's|\\\/|/|g')"
 
   # --- State ---
   if [[ "$startpos" == "$endpos" && "$apply" == "true" ]]; then
@@ -281,7 +295,7 @@ do_status() {
     elif [[ "$lag_bytes" -gt 104857600 ]]; then
       lag_color="$YELLOW"
     fi
-    echo -e "  replay_lsn → current WAL: ${lag_color}${lag_pretty}${NC} (${lag_bytes} bytes)"
+    echo -e "  replay_lsn -> current WAL: ${lag_color}${lag_pretty}${NC} (${lag_bytes} bytes)"
   else
     echo -e "  ${DIM}Could not compute replay lag${NC}"
   fi
