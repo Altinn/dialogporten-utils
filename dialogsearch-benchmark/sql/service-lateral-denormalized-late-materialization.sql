@@ -36,20 +36,20 @@ FROM
             FROM
                 jsonb_to_recordset('--PARTIESANDSERVICESPLACEHOLDER--' :: jsonb) AS x("Parties" text [], "Services" text [])
         ),
-        party_permissions AS (
+        service_permissions AS (
             SELECT
-                p.party,
-                pg.services AS allowed_services
+                s.service,
+                pg.parties AS allowed_parties
             FROM
                 permission_groups pg
-                CROSS JOIN LATERAL unnest(pg.parties) AS p(party)
+                CROSS JOIN LATERAL unnest(pg.services) AS s(service)
         ),
         permission_candidate_ids AS (
             SELECT
                 d_inner."Id",
                 d_inner."ContentUpdatedAt"
             FROM
-                party_permissions pp
+                service_permissions sp
                 CROSS JOIN LATERAL (
                     SELECT
                         d."Id",
@@ -57,16 +57,16 @@ FROM
                     FROM
                         "Dialog" d
                     WHERE
-                        d."Party" = pp.party
-                        AND d."ServiceResource" = ANY(pp.allowed_services)
+                        d."ServiceResource" = sp.service
+                        AND d."Party" = ANY(sp.allowed_parties)
                         AND d."StatusId" = ANY(ARRAY [7, 2, 8] :: int [])
                         AND (
                             d."VisibleFrom" IS NULL
-                            OR d."VisibleFrom" <= NOW()
+                            OR d."VisibleFrom" <= '2026-04-14T13:07:52.9539460+00:00' :: timestamptz
                         )
                         AND (
                             d."ExpiresAt" IS NULL
-                            OR d."ExpiresAt" > NOW()
+                            OR d."ExpiresAt" > '2026-04-14T13:07:52.9539460+00:00' :: timestamptz
                         )
                         AND d."Deleted" = false :: boolean
                         AND (d."SystemLabelsMask" & 1 :: smallint) = 1 :: smallint
