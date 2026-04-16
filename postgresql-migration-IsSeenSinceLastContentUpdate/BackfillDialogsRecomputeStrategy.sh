@@ -1,6 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-source ./backfill-get-orgs.sh
 echo "Select environment:"
 echo "1) local"
 echo "2) azure"
@@ -29,46 +28,35 @@ DATABASE_NAME=Dialogporten
 BATCH_SIZE=5000
 
 TOTAL_UPDATE_COUNT=0
+SECONDS=0
 
-get_orgs "$DATABASE_URL" "$DATABASE_PORT" "$DATABASE_USER" "$DATABASE_NAME"
+ORGS=()
+while IFS= read -r line; do
+  ORGS+=("$line")
+done < <(psql -h "$DATABASE_URL" -p "$DATABASE_PORT" -U "$DATABASE_USER" -d "$DATABASE_NAME" -qAt -f "./sql/GetOrgs.sql")
 
 for ORG in "${ORGS[@]}"; do
   echo ""
   echo "=== Processing org: $ORG ==="
   ORG_UPDATE_COUNT=0
-  SECONDS=0
+  LAST_ID="00000000-0000-0000-0000-000000000000"
 
   while true; do
-    UPDATED=$(psql -h $DATABASE_URL -p $DATABASE_PORT -U $DATABASE_USER -d $DATABASE_NAME -qAt -c "
-      SET lock_timeout = '2s';
-      SET statement_timeout = '60s';
+    RESULT=$(psql -h $DATABASE_URL -p $DATABASE_PORT -U $DATABASE_USER -d $DATABASE_NAME -f "./sql/UpdateDialogsRecomputeStrategy.sql" -q -t -A -v ON_ERROR_STOP=1 -v org=$ORG -v lastId=$LAST_ID -v batchSize=$BATCH_SIZE)
 
-      WITH
-        CTE AS (
-          SELECT
-            \"Id\"
-          FROM
-            \"Dialog\"
-          WHERE
-            \"Org\" = '$ORG'
-            AND \"ContentUpdatedAt\" < '2025-12-01'
-            AND \"IsSeenSinceLastContentUpdate\" = false
-          LIMIT
-            $BATCH_SIZE
-      )
-      UPDATE \"Dialog\" d
-      SET \"IsSeenSinceLastContentUpdate\" = true
-      FROM cte
-      WHERE d.\"Id\" = cte.\"Id\"
-      RETURNING 1;
-    " | wc -l)
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -ne 0 ]; then
+        echo "Error: SQL execution failed (exit code $EXIT_CODE)" >&2
+        exit $EXIT_CODE
+    fi
 
-    END=$EPOCHREALTIME
+    LAST_ID=$(echo "$RESULT" | tail -n 1)
+    UPDATED=$(echo "$RESULT" | grep -c .)
 
     ORG_UPDATE_COUNT=$((ORG_UPDATE_COUNT + UPDATED))
     TOTAL_UPDATE_COUNT=$((TOTAL_UPDATE_COUNT + UPDATED))
 
-    echo "[$ORG] Updated $UPDATED rows (total $TOTAL_UPDATE_COUNT) - elapsed ${SECONDS}s"
+    echo "[$ORG] Updated $UPDATED rows (total $TOTAL_UPDATE_COUNT) - elapsed ${SECONDS}s. Last ID: $LAST_ID"
 
     if [ "$UPDATED" -eq 0 ]; then
       echo "[$ORG] Done. Total updated $ORG_UPDATE_COUNT rows in ${SECONDS}s"
