@@ -9,7 +9,7 @@ read -p "Enter choice [1-2]: " ENV
 case $ENV in
   1)
     DATABASE_USER="postgres"
-    DATABASE_PORT=5432
+    DATABASE_PORT=15432
     ;;
   2)
     DATABASE_USER="dialogportenPgAdmin"
@@ -42,7 +42,7 @@ for ORG in "${ORGS[@]}"; do
   LAST_ID="00000000-0000-0000-0000-000000000000"
 
   while true; do
-    RESULT=$(psql -h $DATABASE_URL -p $DATABASE_PORT -U $DATABASE_USER -d $DATABASE_NAME -f "./sql/UpdateDialogsRecomputeStrategy.sql" -q -t -A -v ON_ERROR_STOP=1 -v org=$ORG -v lastId=$LAST_ID -v batchSize=$BATCH_SIZE)
+    RESULT=$(psql -h $DATABASE_URL -p $DATABASE_PORT -U $DATABASE_USER -d $DATABASE_NAME -f "./sql/UpdateDialogsRecomputeStrategy_Org_CreatedAt_Id.sql" -q -t -A -v ON_ERROR_STOP=1 -v org=$ORG -v lastId=$LAST_ID -v batchSize=$BATCH_SIZE)
 
     EXIT_CODE=$?
     if [ $EXIT_CODE -ne 0 ]; then
@@ -59,7 +59,7 @@ for ORG in "${ORGS[@]}"; do
     echo "[$ORG] Updated $UPDATED rows (total $TOTAL_UPDATE_COUNT) - elapsed ${SECONDS}s. Last ID: $LAST_ID"
 
     if [ "$UPDATED" -eq 0 ]; then
-      echo "[$ORG] Done. Total updated $ORG_UPDATE_COUNT rows in ${SECONDS}s"
+      echo "[$ORG] Done. Total updated $TOTAL_UPDATE_COUNT rows in ${SECONDS}s"
       break
     fi
   done

@@ -24,12 +24,17 @@ bash ./BackfillDialogsFilterStrategy.sh
 ```
 
 ```sh
-# Recompute Strategy
-bash ./BackfillDialogsRecomputeStrategy.sh
+# Recompute Strategy on Org_CreatedAt_Id index
+bash ./BackfillDialogsRecomputeStrategy_Org_CreatedAt_Id.sh
+```
+
+```sh
+# Recompute Strategy on Id_Covering index (no org)
+bash ./BackfillDialogsRecomputeStrategy_Id_Covering.sh
 ```
 
 
 ## Test setup (local)
 ```bash
-PGPASSWORD='supersecret' psql -h localhost -p 5432 -U postgres -d Dialogporten -f ./sql/CreateTestData.sql 
+PGPASSWORD='supersecret' psql -h localhost -p 15432 -U postgres -d Dialogporten -f ./sql/CreateTestData.sql 
 ```
