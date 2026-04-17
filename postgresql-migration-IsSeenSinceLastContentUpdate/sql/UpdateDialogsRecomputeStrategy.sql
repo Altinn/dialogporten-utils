@@ -6,7 +6,7 @@ WITH CTE AS (SELECT "Id"
              WHERE "Org" = :'org'
                AND "ContentUpdatedAt" >= '2025-12-01'
                AND "Id" > :'lastId'
-             ORDER BY "ContentUpdatedAt"
+             ORDER BY "CreatedAt"
              LIMIT :batchSize)
 UPDATE "Dialog" d
 -- Seen = A2 ServiceResource or (Dialog does not have a SystemLabel MarkedAsUnopened AND there is a seen log entry more recent than the dialogs ContentUpdatedAt)
