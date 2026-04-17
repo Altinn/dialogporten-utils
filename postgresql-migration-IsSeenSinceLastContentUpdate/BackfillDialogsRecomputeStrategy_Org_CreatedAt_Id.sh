@@ -23,8 +23,6 @@ case $ENV in
     ;;
 esac
 
-export PGPASSFILE="./.pgpass"
-
 DATABASE_URL=localhost
 DATABASE_NAME=Dialogporten
 BATCH_SIZE=5000
