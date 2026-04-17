@@ -8,10 +8,12 @@ read -p "Enter choice [1-2]: " ENV
 
 case $ENV in
   1)
+    DATABASE_NAME=Dialogporten
     DATABASE_USER="postgres"
     DATABASE_PORT=15432
     ;;
   2)
+    DATABASE_NAME=dialogporten
     DATABASE_USER="dialogportenPgAdmin"
     DATABASE_PORT=5431
     ;;
