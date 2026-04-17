@@ -103,17 +103,30 @@ FROM "Dialog"
 ORDER BY "Id"
     LIMIT 20000 OFFSET 330000;
 
+-- Make 2001 newer dialogs that have system label MarkedAsUnopened + Sent and recent seen log. With the wrong default
+UPDATE "Dialog"
+SET "ContentUpdatedAt"='2026-02-01',
+    "IsSeenSinceLastContentUpdate" = true,
+    "SystemLabelsMask" = 24
+WHERE "Id" IN (SELECT "Id" FROM "Dialog" ORDER BY "Id" LIMIT 2001 OFFSET 350000);
+
+INSERT INTO "DialogSeenLog" ("Id", "CreatedAt", "IsViaServiceOwner", "DialogId", "EndUserTypeId")
+SELECT gen_random_uuid(), now(), false, "Id", 1
+FROM "Dialog"
+ORDER BY "Id"
+    LIMIT 2001 OFFSET 350000;
+
 -- Make 10000 newer dialogs that have system label MarkedAsUnopened and not recent seen log. With the wrong default
 UPDATE "Dialog"
 SET "ContentUpdatedAt"='2026-02-01',
     "IsSeenSinceLastContentUpdate" = true,
     "SystemLabelsMask" = 8
-WHERE "Id" IN (SELECT "Id" FROM "Dialog" ORDER BY "Id" LIMIT 10000 OFFSET 350000);
+WHERE "Id" IN (SELECT "Id" FROM "Dialog" ORDER BY "Id" LIMIT 10000 OFFSET 355000);
 
 INSERT INTO "DialogSeenLog" ("Id", "CreatedAt", "IsViaServiceOwner", "DialogId", "EndUserTypeId")
 SELECT gen_random_uuid(), '2025-12-24', false, "Id", 1
 FROM "Dialog"
 ORDER BY "Id"
-    LIMIT 10000 OFFSET 350000;
+    LIMIT 10000 OFFSET 355000;
 
--- Total number of fixed dialogs should be 160000
+-- Total number of fixed dialogs should be 162001

@@ -15,9 +15,11 @@ WITH CTE AS (SELECT "Id"
                                  WHERE d."Id" = s."DialogId"
                                    AND d."ContentUpdatedAt" < s."CreatedAt")
                  )
-             LIMIT :batchSize)
-UPDATE "Dialog" d
-SET "IsSeenSinceLastContentUpdate" = false
-FROM cte
-WHERE d."Id" = cte."Id"
-RETURNING 1;
+             LIMIT :batchSize),
+     UPDATED AS (UPDATE "Dialog" d
+         SET "IsSeenSinceLastContentUpdate" = false
+         FROM cte
+         WHERE d."Id" = cte."Id"
+         RETURNING 1)
+SELECT COUNT(*)::int
+FROM UPDATED;

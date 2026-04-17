@@ -33,7 +33,7 @@ SECONDS=0
 LAST_ID="00000000-0000-0000-0000-000000000000"
 
 while true; do
-  RESULT=$(psql -h $DATABASE_URL -p $DATABASE_PORT -U $DATABASE_USER -d $DATABASE_NAME -f "./sql/UpdateDialogsRecomputeStrategy_Id_Covering.sql" -q -t -A -v ON_ERROR_STOP=1 -v lastId=$LAST_ID -v batchSize=$BATCH_SIZE)
+  RESULT=$(psql -h $DATABASE_URL -p $DATABASE_PORT -U $DATABASE_USER -d $DATABASE_NAME -f "./sql/UpdateDialogsRecomputeStrategy_Id_Covering.sql" -q -t -A --pset=footer=off -v ON_ERROR_STOP=1 -v lastId=$LAST_ID -v batchSize=$BATCH_SIZE)
 
   EXIT_CODE=$?
   if [ $EXIT_CODE -ne 0 ]; then
@@ -41,8 +41,7 @@ while true; do
       exit $EXIT_CODE
   fi
 
-  LAST_ID=$(echo "$RESULT" | tail -n 1)
-  UPDATED=$(echo "$RESULT" | grep -c .)
+  IFS='|' read -r UPDATED LAST_ID <<< "$RESULT"
 
   TOTAL_UPDATE_COUNT=$((TOTAL_UPDATE_COUNT + UPDATED))
 

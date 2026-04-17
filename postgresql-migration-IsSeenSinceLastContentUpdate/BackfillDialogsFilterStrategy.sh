@@ -41,15 +41,15 @@ for ORG in "${ORGS[@]}"; do
   ORG_UPDATE_COUNT=0
 
   while true; do
-    RESULT=$(psql -h $DATABASE_URL -p $DATABASE_PORT -U $DATABASE_USER -d $DATABASE_NAME -f "./sql/UpdateDialogsFilterStrategy.sql" -q -t -A -v ON_ERROR_STOP=1 -v org=$ORG -v batchSize=$BATCH_SIZE)
+    RESULT=$(psql -h $DATABASE_URL -p $DATABASE_PORT -U $DATABASE_USER -d $DATABASE_NAME -f "./sql/UpdateDialogsFilterStrategy.sql" -q -t -A --pset=footer=off -v ON_ERROR_STOP=1 -v org=$ORG -v batchSize=$BATCH_SIZE)
 
     EXIT_CODE=$?
     if [ $EXIT_CODE -ne 0 ]; then
         echo "Error: SQL execution failed (exit code $EXIT_CODE)" >&2
         exit $EXIT_CODE
     fi
+    IFS='|' read -r UPDATED <<< "$RESULT"
 
-    UPDATED=$(echo "$RESULT" | grep -c .)
     ORG_UPDATE_COUNT=$((ORG_UPDATE_COUNT + UPDATED))
     TOTAL_UPDATE_COUNT=$((TOTAL_UPDATE_COUNT + UPDATED))
 

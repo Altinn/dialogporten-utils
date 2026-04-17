@@ -22,17 +22,15 @@
 # Filter Strategy
 bash ./BackfillDialogsFilterStrategy.sh
 ```
-
-```sh
-# Recompute Strategy on Org_CreatedAt_Id index
-bash ./BackfillDialogsRecomputeStrategy_Org_CreatedAt_Id.sh
-```
-
 ```sh
 # Recompute Strategy on Id_Covering index (no org)
 bash ./BackfillDialogsRecomputeStrategy_Id_Covering.sh
 ```
 
+```sh
+# Recompute Strategy on Org_CreatedAt_Id index (unsafe, seems to miss 4 dialogs)
+bash ./BackfillDialogsRecomputeStrategy_Org_CreatedAt_Id.sh
+```
 
 ## Test setup (local)
 ```bash
