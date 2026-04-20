@@ -54,7 +54,7 @@ while true; do
 
   TOTAL_UPDATE_COUNT=$((TOTAL_UPDATE_COUNT + UPDATED))
 
-  echo "Updated $UPDATED rows (total $TOTAL_UPDATE_COUNT) - elapsed ${SECONDS}s. Last ID: $LAST_ID"
+  echo "Updated: $UPDATED. So far, total: $TOTAL_UPDATE_COUNT - elapsed ${SECONDS}s. Last ID: $LAST_ID"
 
   if [ "$UPDATED" -eq 0 ]; then
     echo "Done. Total updated $TOTAL_UPDATE_COUNT rows in ${SECONDS}s"

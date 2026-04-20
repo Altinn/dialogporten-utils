@@ -54,7 +54,7 @@ for ORG in "${ORGS[@]}"; do
     ORG_UPDATE_COUNT=$((ORG_UPDATE_COUNT + UPDATED))
     TOTAL_UPDATE_COUNT=$((TOTAL_UPDATE_COUNT + UPDATED))
 
-    echo "[$ORG] Updated $UPDATED rows (total $TOTAL_UPDATE_COUNT) - elapsed ${SECONDS}s"
+    echo "[$ORG] Updated: $UPDATED. So far, this org: $ORG_UPDATE_COUNT. So far, total: $TOTAL_UPDATE_COUNT - elapsed ${SECONDS}s"
 
     if [ "$UPDATED" -eq 0 ]; then
       echo "[$ORG] Done. Total updated $ORG_UPDATE_COUNT rows in ${SECONDS}s"
