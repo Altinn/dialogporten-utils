@@ -35,6 +35,11 @@ while IFS= read -r line; do
   ORGS+=("$line")
 done < <(psql -h "$DATABASE_URL" -p "$DATABASE_PORT" -U "$DATABASE_USER" -d "$DATABASE_NAME" -qAt -f "./sql/GetOrgs.sql")
 
+FOLDER_NAME="out"
+FILENAME_LAST_ID="$FOLDER_NAME/$(basename "$0")_$(date +%Y%m%d_%H%M%S).txt"
+
+mkdir -p $FOLDER_NAME
+
 for ORG in "${ORGS[@]}"; do
   echo ""
   echo "=== Processing org: $ORG ==="
@@ -51,6 +56,10 @@ for ORG in "${ORGS[@]}"; do
     fi
 
     IFS='|' read -r UPDATED LAST_ID <<< "$RESULT"
+
+    if [ -n "$LAST_ID" ]; then
+      echo "$LAST_ID" > "$FILENAME_LAST_ID"
+    fi
 
     ORG_UPDATE_COUNT=$((ORG_UPDATE_COUNT + UPDATED))
     TOTAL_UPDATE_COUNT=$((TOTAL_UPDATE_COUNT + UPDATED))

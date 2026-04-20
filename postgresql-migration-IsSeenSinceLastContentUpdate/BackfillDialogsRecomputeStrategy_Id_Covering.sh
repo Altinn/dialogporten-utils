@@ -30,6 +30,10 @@ TOTAL_UPDATE_COUNT=0
 SECONDS=0
 
 LAST_ID="00000000-0000-0000-0000-000000000000"
+FOLDER_NAME="out"
+FILENAME_LAST_ID="$FOLDER_NAME/$(basename "$0")_$(date +%Y%m%d_%H%M%S).txt"
+
+mkdir -p $FOLDER_NAME
 
 while true; do
   RESULT=$(psql -h $DATABASE_URL -p $DATABASE_PORT -U $DATABASE_USER -d $DATABASE_NAME -f "./sql/UpdateDialogsRecomputeStrategy_Id_Covering.sql" -q -t -A --pset=footer=off -v ON_ERROR_STOP=1 -v lastId=$LAST_ID -v batchSize=$BATCH_SIZE)
@@ -41,6 +45,10 @@ while true; do
   fi
 
   IFS='|' read -r UPDATED LAST_ID <<< "$RESULT"
+
+  if [ -n "$LAST_ID" ]; then
+    echo "$LAST_ID" > "$FILENAME_LAST_ID"
+  fi
 
   TOTAL_UPDATE_COUNT=$((TOTAL_UPDATE_COUNT + UPDATED))
 
