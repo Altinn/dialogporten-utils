@@ -11,6 +11,9 @@
 *.sln.docstates
 *.env
 .DS_Store
+.pgpass
+.idea
+./postgresql-migration-IsSeenSinceLastContentUpdate/out
 
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
