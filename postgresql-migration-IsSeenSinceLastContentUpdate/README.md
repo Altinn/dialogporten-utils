@@ -8,7 +8,7 @@
 
 1. Make a .pgpass file in this directory
    ```sh
-   touch .pgpass
+   touch ~/.pgpass
    ```
 2. Add a line to .pgpass with the following format: hostname:port:database:username:password
 3. Set the file permissions of .pgpass
