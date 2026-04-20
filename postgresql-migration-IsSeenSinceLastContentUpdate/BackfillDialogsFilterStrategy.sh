@@ -8,14 +8,17 @@ read -p "Enter choice [1-2]: " ENV
 
 case $ENV in
   1)
+    DATABASE_URL=localhost
     DATABASE_NAME=Dialogporten
     DATABASE_USER="postgres"
     DATABASE_PORT=15432
     ;;
   2)
+    echo "Enter database URL"
+    read DATABASE_URL
     DATABASE_NAME=dialogporten
     DATABASE_USER="dialogportenPgAdmin"
-    DATABASE_PORT=5431
+    DATABASE_PORT=5432
     ;;
   *)
     echo "Invalid option"
@@ -23,7 +26,6 @@ case $ENV in
     ;;
 esac
 
-DATABASE_URL=localhost
 BATCH_SIZE=5000
 
 TOTAL_UPDATE_COUNT=0
