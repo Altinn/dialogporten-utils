@@ -33,10 +33,12 @@ class Variant:
 class Candidate:
     party: str
     unprefixed_party_identifier: str
+    partyresource_short_prefix: str
     estimated_dialog_count: int
     service_resources: tuple[str, ...]
     band: str
     selected: bool
+    skip_reason: str
 
 
 @dataclass(frozen=True)
@@ -187,6 +189,13 @@ def party_short_prefix(party: str) -> str:
     if ":organization:identifier-no:" in party:
         return "o"
     raise ValueError(f"cannot derive partyresource short prefix from party URN: {party}")
+
+
+def partyresource_key(party: str) -> Optional[tuple[str, str]]:
+    try:
+        return (parse_party_urn(party), party_short_prefix(party))
+    except ValueError:
+        return None
 
 
 def classify_bands(rows: list[dict[str, str]]) -> dict[str, str]:
@@ -363,7 +372,12 @@ ORDER BY p."UnprefixedPartyIdentifier", r."UnprefixedResourceIdentifier"
 def build_candidates(args: argparse.Namespace) -> list[Candidate]:
     rows = fetch_candidate_parties(args)
     bands = classify_bands(rows)
-    parties = [(parse_party_urn(row["Party"]), party_short_prefix(row["Party"])) for row in rows]
+    parties = [
+        key
+        for row in rows
+        for key in [partyresource_key(row["Party"])]
+        if key is not None
+    ]
     resource_map = fetch_service_resources(args, parties)
     min_bucket = min(args.service_resource_buckets)
 
@@ -371,16 +385,26 @@ def build_candidates(args: argparse.Namespace) -> list[Candidate]:
     for row in rows:
         party = row["Party"]
         unprefixed = parse_party_urn(party)
-        resources = tuple(resource_map.get((unprefixed, party_short_prefix(party)), []))
-        selected = len(resources) >= min_bucket
+        key = partyresource_key(party)
+        short_prefix = key[1] if key else ""
+        resources = tuple(resource_map.get(key, [])) if key else ()
+        if key is None:
+            skip_reason = "unsupported_party_urn_for_partyresource_lookup"
+        elif len(resources) < min_bucket:
+            skip_reason = f"only_{len(resources)}_service_resources_below_min_bucket_{min_bucket}"
+        else:
+            skip_reason = ""
+        selected = not skip_reason
         candidates.append(
             Candidate(
                 party=party,
                 unprefixed_party_identifier=unprefixed,
+                partyresource_short_prefix=short_prefix,
                 estimated_dialog_count=int(float(row["estimated_count"])),
                 service_resources=resources,
                 band=bands[party],
                 selected=selected,
+                skip_reason=skip_reason,
             )
         )
     return candidates
@@ -452,10 +476,12 @@ def write_candidates_csv(path: Path, candidates: list[Candidate]) -> None:
     fieldnames = [
         "party",
         "unprefixed_party_identifier",
+        "partyresource_short_prefix",
         "estimated_dialog_count",
         "estimated_dialog_count_band",
         "service_resource_count",
         "selected",
+        "skip_reason",
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -465,10 +491,12 @@ def write_candidates_csv(path: Path, candidates: list[Candidate]) -> None:
                 {
                     "party": candidate.party,
                     "unprefixed_party_identifier": candidate.unprefixed_party_identifier,
+                    "partyresource_short_prefix": candidate.partyresource_short_prefix,
                     "estimated_dialog_count": candidate.estimated_dialog_count,
                     "estimated_dialog_count_band": candidate.band,
                     "service_resource_count": len(candidate.service_resources),
                     "selected": candidate.selected,
+                    "skip_reason": candidate.skip_reason,
                 }
             )
 
@@ -1256,10 +1284,12 @@ def run_offline_self_test(args: argparse.Namespace) -> int:
         candidate = Candidate(
             party=case.party,
             unprefixed_party_identifier=case.unprefixed_party_identifier,
+            partyresource_short_prefix="o",
             estimated_dialog_count=case.estimated_dialog_count,
             service_resources=case.service_resources,
             band=case.estimated_dialog_count_band,
             selected=True,
+            skip_reason="",
         )
         write_reports(run_dir, args, variants, metadata, [candidate], [case], manifest_rows)
         if not (run_dir / "report.md").exists():

@@ -240,7 +240,7 @@ The generated where clause may include all resources for a party. To compare inp
 Recommended approach:
 
 1. Query the party's resource URNs as rows, ordered by `UnprefixedResourceIdentifier`.
-2. Join `partyresource."Party"` using both `UnprefixedPartyIdentifier` and `ShortPrefix`, deriving the short prefix from the full `Dialog."Party"` URN.
+2. Join `partyresource."Party"` using both `UnprefixedPartyIdentifier` and `ShortPrefix`, deriving the short prefix from the full `Dialog."Party"` URN. Only `urn:altinn:person:identifier-no:` and `urn:altinn:organization:identifier-no:` map to `partyresource`; other Party URN formats from `pg_stats` are recorded as skipped candidates.
 3. For each bucket size, take the first N resources from that ordered list.
 4. Generate the injected `WHERE` clause from Python:
 
