@@ -26,7 +26,6 @@ case $ENV in
     ;;
 esac
 
-DATABASE_NAME=Dialogporten
 BATCH_SIZE=5000
 
 TOTAL_UPDATE_COUNT=0
