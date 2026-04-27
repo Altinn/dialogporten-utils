@@ -43,7 +43,7 @@ function log {
 }
 
 while true; do
-  RESULT=$(psql -h $DATABASE_URL -p $DATABASE_PORT -U $DATABASE_USER -d $DATABASE_NAME -f "./sql/UpdateDialogsRecomputeStrategy_Id_Covering.sql" -q -t -A --pset=footer=off -v ON_ERROR_STOP=1 -v lastId=$LAST_ID -v batchSize=$BATCH_SIZE)
+  RESULT=$(psql -h "$DATABASE_URL" -p "$DATABASE_PORT" -U "$DATABASE_USER" -d "$DATABASE_NAME" -f "./sql/UpdateDialogsRecomputeStrategy_Id_Covering.sql" -q -t -A --pset=footer=off -v ON_ERROR_STOP=1 -v lastId=$LAST_ID -v batchSize=$BATCH_SIZE)
 
   EXIT_CODE=$?
   if [ $EXIT_CODE -ne 0 ]; then
