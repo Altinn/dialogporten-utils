@@ -40,11 +40,16 @@ done < <(psql -h "$DATABASE_URL" -p "$DATABASE_PORT" -U "$DATABASE_USER" -d "$DA
 FOLDER_NAME="out"
 FILENAME_LAST_ID="$FOLDER_NAME/$(basename "$0")_$(date +%Y%m%d_%H%M%S).txt"
 
+function log() {
+  echo "$1"
+  echo "$1" >> "$FILENAME_LOG"
+}
+
 mkdir -p $FOLDER_NAME
 
 for ORG in "${ORGS[@]}"; do
-  echo ""
-  echo "=== Processing org: $ORG ==="
+  log ""
+  log "=== Processing org: $ORG ==="
   ORG_UPDATE_COUNT=0
   LAST_ID="00000000-0000-0000-0000-000000000000"
 
@@ -53,27 +58,27 @@ for ORG in "${ORGS[@]}"; do
 
     EXIT_CODE=$?
     if [ $EXIT_CODE -ne 0 ]; then
-        echo "Error: SQL execution failed (exit code $EXIT_CODE)" >&2
+        log "Error: SQL execution failed (exit code $EXIT_CODE)" >&2
         exit $EXIT_CODE
     fi
 
     IFS='|' read -r UPDATED LAST_ID <<< "$RESULT"
 
     if [ -n "$LAST_ID" ]; then
-      echo "$LAST_ID" > "$FILENAME_LAST_ID"
+      log "$LAST_ID" > "$FILENAME_LAST_ID"
     fi
 
     ORG_UPDATE_COUNT=$((ORG_UPDATE_COUNT + UPDATED))
     TOTAL_UPDATE_COUNT=$((TOTAL_UPDATE_COUNT + UPDATED))
 
-    echo "[$ORG] Updated: $UPDATED. So far, this org: $ORG_UPDATE_COUNT. So far, total: $TOTAL_UPDATE_COUNT - elapsed ${SECONDS}s. Last ID: $LAST_ID"
+    log "[$ORG] Updated: $UPDATED. So far, this org: $ORG_UPDATE_COUNT. So far, total: $TOTAL_UPDATE_COUNT - elapsed ${SECONDS}s. Last ID: $LAST_ID"
 
     if [ "$UPDATED" -eq 0 ]; then
-      echo "[$ORG] Done. Total updated $TOTAL_UPDATE_COUNT rows in ${SECONDS}s"
+      log "[$ORG] Done. Total updated $TOTAL_UPDATE_COUNT rows in ${SECONDS}s"
       break
     fi
   done
 done
 
-echo ""
-echo "All Done. Total updated $TOTAL_UPDATE_COUNT rows in ${SECONDS}s"
+log ""
+log "All Done. Total updated $TOTAL_UPDATE_COUNT rows in ${SECONDS}s"
