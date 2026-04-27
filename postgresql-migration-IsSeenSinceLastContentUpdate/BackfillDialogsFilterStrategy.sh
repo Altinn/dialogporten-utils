@@ -38,7 +38,7 @@ while IFS= read -r line; do
   ORGS+=("$line")
 done < <(psql -h "$DATABASE_URL" -p "$DATABASE_PORT" -U "$DATABASE_USER" -d "$DATABASE_NAME" -qAt -f "./sql/GetOrgs.sql")
 
-function log() {
+function log {
   echo "$1"
   echo "$1" >> "$FILENAME_LOG"
 }

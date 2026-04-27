@@ -40,7 +40,7 @@ done < <(psql -h "$DATABASE_URL" -p "$DATABASE_PORT" -U "$DATABASE_USER" -d "$DA
 FOLDER_NAME="out"
 FILENAME_LAST_ID="$FOLDER_NAME/$(basename "$0")_$(date +%Y%m%d_%H%M%S).txt"
 
-function log() {
+function log {
   echo "$1"
   echo "$1" >> "$FILENAME_LOG"
 }

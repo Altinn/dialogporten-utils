@@ -37,7 +37,7 @@ FILENAME_LOG="$FOLDER_NAME/$(basename "$0")_$(date +%Y%m%d_%H%M%S).txt"
 
 mkdir -p $FOLDER_NAME
 
-function log() {
+function log {
   echo "$1"
   echo "$1" >> "$FILENAME_LOG"
 }
