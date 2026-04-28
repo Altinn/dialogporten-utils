@@ -478,6 +478,8 @@ def choose_case_parties(
         return (same_band, band_distance, -candidate.estimated_dialog_count, candidate.party)
 
     selected = [seed]
+    if len(selected) >= party_bucket:
+        return selected
     for candidate in sorted(candidates, key=sort_key):
         if candidate.party == seed.party:
             continue
@@ -543,35 +545,51 @@ def choose_until_case_target(args: argparse.Namespace, candidates: list[Candidat
 
 def build_cases(args: argparse.Namespace, candidates: list[Candidate]) -> list[BenchmarkCase]:
     cases: list[BenchmarkCase] = []
-    for candidate in candidates:
-        for party_bucket in args.party_buckets:
-            party_candidates = choose_case_parties(args, candidates, candidate, party_bucket)
-            if len(party_candidates) < party_bucket:
-                continue
-            parties = tuple(sorted(party.party for party in party_candidates))
-            service_pool = service_union(party_candidates)
-            for service_bucket in args.service_buckets:
-                services = choose_case_services(args, service_pool, len(cases) + 1, service_bucket)
-                if len(services) < service_bucket:
-                    continue
-                case_id = f"case_{len(cases) + 1:04d}_p_{party_bucket}_s_{service_bucket}"
-                cases.append(
-                    BenchmarkCase(
-                        case_id=case_id,
-                        hot_party=candidate.party,
-                        unprefixed_party_identifier=candidate.unprefixed_party_identifier,
-                        estimated_dialog_count=candidate.estimated_dialog_count,
-                        estimated_dialog_count_band=candidate.band,
-                        permission_group_count=1,
-                        party_count=party_bucket,
-                        service_count=service_bucket,
-                        parties=parties,
-                        services=services,
-                        payload_json=build_payload(parties, services),
-                    )
-                )
-                if len(cases) >= args.cases:
-                    return cases
+    if not candidates:
+        return cases
+
+    bucket_pairs = [
+        (party_bucket, service_bucket)
+        for party_bucket in args.party_buckets
+        for service_bucket in args.service_buckets
+    ]
+    max_attempts = max(args.cases * len(bucket_pairs) * 2, len(candidates) * len(bucket_pairs))
+    seen: set[tuple[str, int, int]] = set()
+
+    for attempt in range(max_attempts):
+        candidate = candidates[attempt % len(candidates)]
+        party_bucket, service_bucket = bucket_pairs[attempt % len(bucket_pairs)]
+        key = (candidate.party, party_bucket, service_bucket)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        party_candidates = choose_case_parties(args, candidates, candidate, party_bucket)
+        if len(party_candidates) < party_bucket:
+            continue
+        parties = tuple(sorted(party.party for party in party_candidates))
+        service_pool = service_union(party_candidates)
+        services = choose_case_services(args, service_pool, len(cases) + 1, service_bucket)
+        if len(services) < service_bucket:
+            continue
+        case_id = f"case_{len(cases) + 1:04d}_p_{party_bucket}_s_{service_bucket}"
+        cases.append(
+            BenchmarkCase(
+                case_id=case_id,
+                hot_party=candidate.party,
+                unprefixed_party_identifier=candidate.unprefixed_party_identifier,
+                estimated_dialog_count=candidate.estimated_dialog_count,
+                estimated_dialog_count_band=candidate.band,
+                permission_group_count=1,
+                party_count=party_bucket,
+                service_count=service_bucket,
+                parties=parties,
+                services=services,
+                payload_json=build_payload(parties, services),
+            )
+        )
+        if len(cases) >= args.cases:
+            return cases
     return cases
 
 
