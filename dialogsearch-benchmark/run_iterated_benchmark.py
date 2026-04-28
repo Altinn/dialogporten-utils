@@ -287,7 +287,18 @@ def build_summary_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run iterated benchmarks with generated samples.")
-    party_group = parser.add_mutually_exclusive_group(required=True)
+    hot_group = parser.add_mutually_exclusive_group()
+    hot_group.add_argument(
+        "--generate-hot-party-service-pool-with-count",
+        type=int,
+        help="Generate correlated hot party/service pool with the given party count",
+    )
+    hot_group.add_argument(
+        "--with-party-service-pool-file",
+        help="Use an existing correlated party/service JSON pool file",
+    )
+
+    party_group = parser.add_mutually_exclusive_group()
     party_group.add_argument(
         "--generate-party-pool-with-count",
         type=int,
@@ -298,7 +309,7 @@ def main() -> int:
         help="Use an existing party pool file (one value per line)",
     )
 
-    service_group = parser.add_mutually_exclusive_group(required=True)
+    service_group = parser.add_mutually_exclusive_group()
     service_group.add_argument(
         "--generate-service-pool-with-count",
         type=int,
@@ -346,6 +357,31 @@ def main() -> int:
 
     if args.iterations < 1:
         die("iterations must be >= 1")
+    hot_party_services_mode = (
+        args.generate_hot_party_service_pool_with_count is not None
+        or args.with_party_service_pool_file is not None
+    )
+    independent_party_mode = (
+        args.generate_party_pool_with_count is not None
+        or args.with_party_pool_file is not None
+    )
+    independent_service_mode = (
+        args.generate_service_pool_with_count is not None
+        or args.with_service_pool_file is not None
+    )
+    if hot_party_services_mode:
+        if independent_party_mode or independent_service_mode:
+            die("hot party/service mode cannot be combined with independent party/service pool options")
+    else:
+        if not independent_party_mode:
+            die("one of --generate-party-pool-with-count or --with-party-pool-file is required")
+        if not independent_service_mode:
+            die("one of --generate-service-pool-with-count or --with-service-pool-file is required")
+    if (
+        args.generate_hot_party_service_pool_with_count is not None
+        and args.generate_hot_party_service_pool_with_count < 1
+    ):
+        die("generate-hot-party-service-pool-with-count must be >= 1")
     if args.generate_party_pool_with_count is not None and args.generate_party_pool_with_count < 1:
         die("generate-party-pool-with-count must be >= 1")
     if args.generate_service_pool_with_count is not None and args.generate_service_pool_with_count < 1:
@@ -375,6 +411,7 @@ def main() -> int:
 
     parties_path = output_dir / "parties.txt"
     services_path = output_dir / "services.txt"
+    party_services_path = output_dir / "party-services.json"
 
     sql_paths = resolve_globs(args.sqls)
     if not sql_paths:
@@ -386,7 +423,31 @@ def main() -> int:
         shutil.copy2(path, copied)
         copied_sql_paths.append(copied)
 
-    if args.with_party_pool_file:
+    if args.with_party_service_pool_file:
+        src = Path(args.with_party_service_pool_file)
+        if not src.is_file():
+            die(f"Party/service pool file not found: {src}")
+        log_info(f"Using existing correlated party/service pool file: {src}")
+        shutil.copy2(src, party_services_path)
+    elif args.generate_hot_party_service_pool_with_count is not None:
+        log_info("Generating hot party/service samples")
+        cmd = [
+            sys.executable,
+            str(SCRIPT_DIR / "generate_samples.py"),
+            "party-services",
+            str(args.generate_hot_party_service_pool_with_count),
+        ]
+        log_command(cmd)
+        code, stdout, stderr = run_command(cmd, timeout_s=args.script_timeout)
+        if code != 0:
+            print(stderr, file=sys.stderr)
+            die("generate_samples.py party-services failed")
+        if not stdout.strip():
+            if stderr.strip():
+                print(stderr, file=sys.stderr)
+            die("generate_samples.py party-services returned no data")
+        write_text(party_services_path, stdout.strip() + "\n")
+    elif args.with_party_pool_file:
         src = Path(args.with_party_pool_file)
         if not src.is_file():
             die(f"Party pool file not found: {src}")
@@ -411,7 +472,9 @@ def main() -> int:
             die("generate_samples.py party returned no data")
         write_text(parties_path, stdout.strip() + "\n")
 
-    if args.with_service_pool_file:
+    if hot_party_services_mode:
+        log_info("Skipping independent service pool in correlated hot party/service mode")
+    elif args.with_service_pool_file:
         src = Path(args.with_service_pool_file)
         if not src.is_file():
             die(f"Service pool file not found: {src}")
@@ -450,10 +513,6 @@ def main() -> int:
         cmd = [
             sys.executable,
             str(SCRIPT_DIR / "generate_cases.py"),
-            "--parties-path",
-            str(parties_path),
-            "--services-path",
-            str(services_path),
             "--out-dir",
             str(iter_cases_dir),
             "--seed",
@@ -462,6 +521,15 @@ def main() -> int:
             "--generate-set",
             args.generate_set,
         ]
+        if hot_party_services_mode:
+            cmd[2:2] = ["--party-services-path", str(party_services_path)]
+        else:
+            cmd[2:2] = [
+                "--parties-path",
+                str(parties_path),
+                "--services-path",
+                str(services_path),
+            ]
         log_command(cmd)
         code, stdout, stderr = run_command(cmd, timeout_s=args.script_timeout)
         if code != 0:

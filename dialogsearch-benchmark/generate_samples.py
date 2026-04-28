@@ -39,7 +39,7 @@ def main():
 
     if len(sys.argv) < 3:
         print("Usage: ./generate_samples.py <type> <count>", file=sys.stderr)
-        print("Types: party, service", file=sys.stderr)
+        print("Types: party, service, party-services", file=sys.stderr)
         sys.exit(1)
 
     sample_type = sys.argv[1].lower()
@@ -52,6 +52,65 @@ def main():
         print("Error: Count must be >= 1.", file=sys.stderr)
         sys.exit(1)
 
+    if sample_type == "party-services":
+        query = f"""
+WITH hot_parties AS (
+    SELECT
+        unnest(most_common_vals::text::text[]) AS "Party",
+        (
+            unnest(most_common_freqs::float8[])
+            * (SELECT reltuples FROM pg_class WHERE relname = 'Dialog')
+        )::bigint AS "EstimatedDialogCount"
+    FROM pg_stats
+    WHERE tablename = 'Dialog'
+      AND attname = 'Party'
+),
+party_services AS (
+    SELECT
+        CASE p."ShortPrefix"
+            WHEN 'p' THEN 'urn:altinn:person:identifier-no:' || p."UnprefixedPartyIdentifier"
+            WHEN 'o' THEN 'urn:altinn:organization:identifier-no:' || p."UnprefixedPartyIdentifier"
+        END AS "Party",
+        'urn:altinn:resource:' || r."UnprefixedResourceIdentifier" AS "Service"
+    FROM partyresource."Party" p
+    JOIN partyresource."PartyResource" pr ON pr."PartyId" = p."Id"
+    JOIN partyresource."Resource" r ON pr."ResourceId" = r."Id"
+)
+SELECT COALESCE(
+    jsonb_agg(
+        jsonb_build_object(
+            'Party', hp."Party",
+            'EstimatedDialogCount', hp."EstimatedDialogCount",
+            'Services', ps."Services"
+        )
+        ORDER BY hp."EstimatedDialogCount" DESC, hp."Party"
+    ),
+    '[]'::jsonb
+)::text
+FROM (
+    SELECT hp."Party", hp."EstimatedDialogCount"
+    FROM hot_parties hp
+    WHERE EXISTS (
+        SELECT 1
+        FROM party_services ps
+        WHERE ps."Party" = hp."Party"
+    )
+    ORDER BY hp."EstimatedDialogCount" DESC
+    LIMIT {target_count}
+) hp
+JOIN LATERAL (
+    SELECT jsonb_agg(ps."Service" ORDER BY ps."Service") AS "Services"
+    FROM party_services ps
+    WHERE ps."Party" = hp."Party"
+) ps ON ps."Services" IS NOT NULL
+"""
+        output = run_query(conn_str, query)
+        if output:
+            print(output)
+        else:
+            print("No party/service values found.", file=sys.stderr)
+        return
+
     # 2. Map type to Column Name
     mapping = {
         "party": '"Party"',
@@ -59,7 +118,7 @@ def main():
     }
 
     if sample_type not in mapping:
-        print(f"Error: Unknown type '{sample_type}'. Use 'party' or 'service'.", file=sys.stderr)
+        print(f"Error: Unknown type '{sample_type}'. Use 'party', 'service', or 'party-services'.", file=sys.stderr)
         sys.exit(1)
 
     col_name = mapping[sample_type]

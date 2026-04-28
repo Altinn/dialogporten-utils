@@ -35,6 +35,26 @@ pip install openpyxl
 
 This creates a new output directory named `benchmark-YYYYMMDD-HHMM` in the current working directory (unless you override it with `--out-dir`).
 
+## Hot Party Mode
+
+Use hot party mode when you want cases backed by parties with the highest estimated number of dialogs and by each party's real service resources.
+
+```bash
+./run_iterated_benchmark.py \
+  --generate-hot-party-service-pool-with-count 500 \
+  --generate-set "1,0,1; 10,0,10; 100,0,100" \
+  --sqls "sql/*.sql" \
+  --iterations 10 \
+  --seed 1337 \
+  --rounds-per-iteration 2
+```
+
+In this mode the generated pool is stored as `output/party-services.json`. Each case group contains exactly one party and that party's matching services, so the generated `Parties`/`Services` arrays do not create artificial cross-product pairs. Because of that, each `--generate-set` entry must use `groups == parties`.
+
+The service count field has a special meaning in hot party mode:
+- `0`: use all known services for each selected party.
+- `N > 0`: sample up to `N` known services for each selected party.
+
 ## Output Layout (run_iterated_benchmark)
 
 ```text
@@ -52,8 +72,9 @@ benchmark-YYYYMMDD-HHMM/
     service.sql
     ...
   output/
-    parties.txt
-    services.txt
+    parties.txt              # independent mode
+    services.txt             # independent mode
+    party-services.json      # hot party mode
     csvs/
       2000.csv
       2001.csv
@@ -88,6 +109,8 @@ Notes:
 Runs full benchmark iterations end‑to‑end.
 
 Key options:
+- `--generate-hot-party-service-pool-with-count`: generate correlated party/service pool from the hottest parties.
+- `--with-party-service-pool-file`: use an existing correlated party/service JSON pool file.
 - `--generate-party-pool-with-count`: generate party pool with the given size.
 - `--with-party-pool-file`: use an existing party pool file.
 - `--generate-service-pool-with-count`: generate service pool with the given size.
@@ -101,7 +124,7 @@ Key options:
 - `--padding`: zero‑padding width for iteration dirs (default 3).
 
 Behavior:
-1. Generates `parties.txt` and `services.txt` once (via `generate_samples.py`).
+1. Generates `parties.txt` and `services.txt` once (via `generate_samples.py`), or `party-services.json` for hot party mode.
 2. For each iteration:
    - Generates JSON cases (via `generate_cases.py`).
    - Runs each SQL file separately via `run_benchmark.py` with `--csv` and `--print-explain`.
@@ -135,6 +158,7 @@ Modes:
 - `--generate-default-set`
 - `--generate-set "p,s,g;..."`
 - `--parties/--services/--groups` for single case
+- Add `--party-services-path party-services.json` to generate correlated cases where each group is one real party/service-resource pair set.
 
 Useful flags:
 - `--omit-seed-in-filename` to produce stable names across iterations.
@@ -142,10 +166,13 @@ Useful flags:
 ### `generate_samples.py`
 Samples distinct `Party` and `ServiceResource` values from the `Dialog` table using `TABLESAMPLE`. Output is plain text; one value per line.
 
+It can also emit a correlated JSON pool of hot parties and their service resources using `party-services`.
+
 Usage:
 ```bash
 ./generate_samples.py party 50000
 ./generate_samples.py service 5000
+./generate_samples.py party-services 500
 ```
 
 ### `generate_excel_summary.py`
