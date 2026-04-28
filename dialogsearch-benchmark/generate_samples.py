@@ -4,6 +4,7 @@ import sys
 import subprocess
 
 DEFAULT_TIMEOUT_SECONDS = 30
+HOT_PARTY_SERVICE_CANDIDATE_MULTIPLIER = 5
 
 
 def run_query(conn_str, sql, timeout_s=DEFAULT_TIMEOUT_SECONDS):
@@ -38,7 +39,7 @@ def main():
         sys.exit(1)
 
     if len(sys.argv) < 3:
-        print("Usage: ./generate_samples.py <type> <count>", file=sys.stderr)
+        print("Usage: ./generate_samples.py <type> <count> [query-timeout-seconds]", file=sys.stderr)
         print("Types: party, service, party-services", file=sys.stderr)
         sys.exit(1)
 
@@ -51,8 +52,17 @@ def main():
     if target_count < 1:
         print("Error: Count must be >= 1.", file=sys.stderr)
         sys.exit(1)
+    try:
+        query_timeout_s = int(sys.argv[3]) if len(sys.argv) >= 4 else DEFAULT_TIMEOUT_SECONDS
+    except ValueError:
+        print("Error: Query timeout must be an integer.", file=sys.stderr)
+        sys.exit(1)
+    if query_timeout_s < 1:
+        print("Error: Query timeout must be >= 1.", file=sys.stderr)
+        sys.exit(1)
 
     if sample_type == "party-services":
+        candidate_count = target_count * HOT_PARTY_SERVICE_CANDIDATE_MULTIPLIER
         query = f"""
 WITH hot_parties AS (
     SELECT
@@ -65,46 +75,61 @@ WITH hot_parties AS (
     WHERE tablename = 'Dialog'
       AND attname = 'Party'
 ),
-party_services AS (
+hot_party_candidates AS (
+    SELECT "Party", "EstimatedDialogCount"
+    FROM hot_parties
+    ORDER BY "EstimatedDialogCount" DESC
+    LIMIT {candidate_count}
+),
+parsed_hot_parties AS (
     SELECT
-        CASE p."ShortPrefix"
-            WHEN 'p' THEN 'urn:altinn:person:identifier-no:' || p."UnprefixedPartyIdentifier"
-            WHEN 'o' THEN 'urn:altinn:organization:identifier-no:' || p."UnprefixedPartyIdentifier"
-        END AS "Party",
-        'urn:altinn:resource:' || r."UnprefixedResourceIdentifier" AS "Service"
-    FROM partyresource."Party" p
-    JOIN partyresource."PartyResource" pr ON pr."PartyId" = p."Id"
-    JOIN partyresource."Resource" r ON pr."ResourceId" = r."Id"
+        "Party",
+        "EstimatedDialogCount",
+        CASE
+            WHEN "Party" LIKE 'urn:altinn:person:identifier-no:%' THEN 'p'
+            WHEN "Party" LIKE 'urn:altinn:organization:identifier-no:%' THEN 'o'
+        END AS "ShortPrefix",
+        CASE
+            WHEN "Party" LIKE 'urn:altinn:person:identifier-no:%'
+                THEN substring("Party" from length('urn:altinn:person:identifier-no:') + 1)
+            WHEN "Party" LIKE 'urn:altinn:organization:identifier-no:%'
+                THEN substring("Party" from length('urn:altinn:organization:identifier-no:') + 1)
+        END AS "UnprefixedPartyIdentifier"
+    FROM hot_party_candidates
 )
 SELECT COALESCE(
     jsonb_agg(
         jsonb_build_object(
             'Party', hp."Party",
             'EstimatedDialogCount', hp."EstimatedDialogCount",
-            'Services', ps."Services"
+            'Services', hp."Services"
         )
         ORDER BY hp."EstimatedDialogCount" DESC, hp."Party"
     ),
     '[]'::jsonb
 )::text
 FROM (
-    SELECT hp."Party", hp."EstimatedDialogCount"
-    FROM hot_parties hp
-    WHERE EXISTS (
-        SELECT 1
-        FROM party_services ps
-        WHERE ps."Party" = hp."Party"
-    )
+    SELECT
+        hp."Party",
+        hp."EstimatedDialogCount",
+        jsonb_agg(
+            'urn:altinn:resource:' || r."UnprefixedResourceIdentifier"
+            ORDER BY r."UnprefixedResourceIdentifier"
+        ) AS "Services"
+    FROM parsed_hot_parties hp
+    JOIN partyresource."Party" p
+      ON p."ShortPrefix" = hp."ShortPrefix"
+     AND p."UnprefixedPartyIdentifier" = hp."UnprefixedPartyIdentifier"
+    JOIN partyresource."PartyResource" pr ON pr."PartyId" = p."Id"
+    JOIN partyresource."Resource" r ON pr."ResourceId" = r."Id"
+    WHERE hp."ShortPrefix" IS NOT NULL
+      AND hp."UnprefixedPartyIdentifier" IS NOT NULL
+    GROUP BY hp."Party", hp."EstimatedDialogCount"
     ORDER BY hp."EstimatedDialogCount" DESC
     LIMIT {target_count}
 ) hp
-JOIN LATERAL (
-    SELECT jsonb_agg(ps."Service" ORDER BY ps."Service") AS "Services"
-    FROM party_services ps
-    WHERE ps."Party" = hp."Party"
-) ps ON ps."Services" IS NOT NULL
 """
-        output = run_query(conn_str, query)
+        output = run_query(conn_str, query, timeout_s=query_timeout_s)
         if output:
             print(output)
         else:
@@ -125,7 +150,7 @@ JOIN LATERAL (
 
     # 3. Get Row Estimate for Table
     est_sql = "SELECT reltuples::bigint FROM pg_class WHERE relname = 'Dialog' LIMIT 1"
-    res = run_query(conn_str, est_sql)
+    res = run_query(conn_str, est_sql, timeout_s=query_timeout_s)
     
     # Default to 1B if estimate is missing or zero
     total_est = int(res) if res and res.isdigit() and int(res) > 0 else 1000000000
@@ -146,7 +171,7 @@ JOIN LATERAL (
             f'LIMIT {target_count}'
         )
         
-        output = run_query(conn_str, query)
+        output = run_query(conn_str, query, timeout_s=query_timeout_s)
         
         if output:
             for val in output.splitlines():

@@ -390,6 +390,7 @@ def main() -> int:
         die("rounds-per-iteration must be >= 1")
     if args.script_timeout < 1:
         die("script-timeout must be >= 1")
+    sample_query_timeout = max(1, args.script_timeout - 5)
 
     now = dt.datetime.now()
     timestamp = now.strftime("%Y%m%d%H%M")
@@ -436,6 +437,7 @@ def main() -> int:
             str(SCRIPT_DIR / "generate_samples.py"),
             "party-services",
             str(args.generate_hot_party_service_pool_with_count),
+            str(sample_query_timeout),
         ]
         log_command(cmd)
         code, stdout, stderr = run_command(cmd, timeout_s=args.script_timeout)
@@ -460,6 +462,7 @@ def main() -> int:
             str(SCRIPT_DIR / "generate_samples.py"),
             "party",
             str(args.generate_party_pool_with_count),
+            str(sample_query_timeout),
         ]
         log_command(cmd)
         code, stdout, stderr = run_command(cmd, timeout_s=args.script_timeout)
@@ -487,6 +490,7 @@ def main() -> int:
             str(SCRIPT_DIR / "generate_samples.py"),
             "service",
             str(args.generate_service_pool_with_count),
+            str(sample_query_timeout),
         ]
         log_command(cmd)
         code, stdout, stderr = run_command(cmd, timeout_s=args.script_timeout)
