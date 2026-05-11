@@ -33,6 +33,8 @@ SECONDS=0
 FOLDER_NAME="out"
 FILENAME_LOG="$FOLDER_NAME/$(basename "$0")_$(date +%Y%m%d_%H%M%S).txt"
 
+mkdir -p $FOLDER_NAME
+
 ORGS=()
 while IFS= read -r line; do
   ORGS+=("$line")
