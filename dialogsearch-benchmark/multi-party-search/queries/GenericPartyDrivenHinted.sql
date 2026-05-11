@@ -1,3 +1,15 @@
+/*+ 
+	DisableIndex(d
+		IX_Dialog_Party_ServiceResource_ContentUpdatedAt_Id_NotDeleted
+	 	IX_Dialog_ServiceResource_Party_ContentUpdatedAt_Id_NotDeleted
+	 	IX_Dialog_Party_CreatedAt_Id
+	 	IX_Dialog_Party_UpdatedAt_Id
+	 	IX_Dialog_Party_DueAt_Id
+	 	IX_Dialog_Org_Party_ContentUpdatedAt_Id
+	 	IX_Dialog_Org_ServiceResource_ContentUpdatedAt_Id
+	 	IX_Dialog_ServiceResource
+	)
+*/
 SELECT
     d."Id",
     d."ContentUpdatedAt",
@@ -35,20 +47,20 @@ FROM
             FROM
                 jsonb_to_recordset({{PARTIES_AND_SERVICES_JSON}} :: jsonb) AS x("Parties" text [], "Services" text [])
         ),
-        service_permissions AS (
+        party_permissions AS (
             SELECT
-                s.service,
-                pg.parties AS allowed_parties
+                p.party,
+                pg.services AS allowed_services
             FROM
                 permission_groups pg
-                CROSS JOIN LATERAL unnest(pg.services) AS s(service)
+                CROSS JOIN LATERAL unnest(pg.parties) AS p(party)
         ),
         permission_candidate_ids AS (
             SELECT
                 d_inner."Id",
                 d_inner."ContentUpdatedAt"
             FROM
-                service_permissions sp
+                party_permissions pp
                 CROSS JOIN LATERAL (
                     SELECT
                         d."Id",
@@ -56,8 +68,8 @@ FROM
                     FROM
                         "Dialog" d
                     WHERE
-                        d."ServiceResource" = sp.service
-                        AND d."Party" = ANY(sp.allowed_parties)
+                        d."Party" = pp.party
+                        AND d."ServiceResource" = ANY(pp.allowed_services)
                         AND d."StatusId" = ANY(ARRAY [7, 2, 8] :: int [])
                         AND (
                             d."VisibleFrom" IS NULL
@@ -68,7 +80,7 @@ FROM
                             OR d."ExpiresAt" > {{AS_OF}} :: timestamptz
                         )
                         AND d."Deleted" = false :: boolean
-                        AND (d."SystemLabelsMask" & 1 :: smallint) = 1 :: smallint
+                        -- AND (d."SystemLabelsMask" & 1 :: smallint) = 1 :: smallint
                     ORDER BY
                         "d"."ContentUpdatedAt" DESC,
                         "d"."Id" DESC

@@ -68,7 +68,7 @@ FROM
                             OR d."ExpiresAt" > {{AS_OF}} :: timestamptz
                         )
                         AND d."Deleted" = false :: boolean
-                        AND (d."SystemLabelsMask" & 1 :: smallint) = 1 :: smallint
+                        -- AND (d."SystemLabelsMask" & 1 :: smallint) = 1 :: smallint
                     ORDER BY
                         "d"."ContentUpdatedAt" DESC,
                         "d"."Id" DESC
