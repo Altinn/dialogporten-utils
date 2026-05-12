@@ -19,7 +19,6 @@ Typical usage:
   --host HOST \
   --dbname dialogporten \
   --user USER \
-  --cases 20 \
   --passes 3 \
   --runs-per-variant 2
 ```
@@ -35,7 +34,8 @@ Useful options:
 - `--buckets "1;20,5;50,100;20"`: explicit party/service bucket pairs.
   When provided, this overrides the Cartesian product from `--party-buckets`
   and `--service-buckets`.
-- `--cases N`: number of generated benchmark cases.
+- `--cases N`: number of generated benchmark cases. Defaults to the number of
+  active party/service bucket pairs.
 - `--passes N`: number of full sweeps over all cases.
 - `--runs-per-variant N`: immediate repeats per variant for each case/pass.
 - `--candidate-source pg-stats-mcv`: candidate discovery source. Use

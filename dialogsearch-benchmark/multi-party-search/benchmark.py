@@ -1492,8 +1492,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--cases",
         type=int,
-        default=20,
-        help="target number of benchmark cases",
+        help="target number of benchmark cases; defaults to the number of active party/service bucket pairs",
     )
     parser.add_argument("--passes", type=int, default=3)
     parser.add_argument("--runs-per-variant", type=int, default=2)
@@ -1564,7 +1563,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     if args.party_limit <= 0:
         parser.error("--party-limit must be positive")
-    if args.cases <= 0:
+    if args.cases is None:
+        args.cases = len(active_bucket_pairs(args))
+    elif args.cases <= 0:
         parser.error("--cases must be positive")
     if args.passes <= 0:
         parser.error("--passes must be positive")
