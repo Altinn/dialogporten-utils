@@ -1,0 +1,1 @@
+Your task is to thoroughly analyze the validity and information yielded from the benchmark run in $BENCHMARK_RUN_DIR. Analyze the results, and report a brief summary along with more detailed findings. Discuss what take-aways this gives, statistical/methodical weaknesses, and suggest improvements to the benchmark methodology if relevant.

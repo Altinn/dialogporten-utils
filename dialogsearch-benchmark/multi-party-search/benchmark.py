@@ -7,6 +7,7 @@ import math
 import os
 import random
 import re
+import shlex
 import statistics
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from typing import Any, Optional
 
 ROOT = Path(__file__).resolve().parent
 PLACEHOLDER_RE = re.compile(r"\{\{[A-Z_]+\}\}")
+IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,26 @@ def utc_now_iso() -> str:
 
 def sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def quote_identifier(value: str) -> str:
+    if not IDENTIFIER_RE.match(value):
+        raise ValueError(f"unsupported SQL identifier: {value!r}")
+    return '"' + value.replace('"', '""') + '"'
+
+
+def quote_qualified_identifier(value: str) -> str:
+    parts = value.split(".")
+    if len(parts) not in (1, 2):
+        raise ValueError(f"expected unqualified or schema-qualified table name, got: {value!r}")
+    return ".".join(quote_identifier(part) for part in parts)
+
+
+def command_line(args: argparse.Namespace) -> str:
+    argv = getattr(args, "original_argv", None)
+    if argv is None:
+        return ""
+    return " ".join(shlex.quote(part) for part in [Path(__file__).name, *argv])
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -313,7 +335,61 @@ def ensure_party_mcv_stats(args: argparse.Namespace) -> dict[str, str]:
     )
 
 
-def fetch_candidate_parties(args: argparse.Namespace) -> list[dict[str, str]]:
+def sampled_distribution_population_query(args: argparse.Namespace) -> str:
+    table_name = quote_qualified_identifier(args.sampled_candidate_table)
+    sample_percent = args.sampled_candidate_percent
+    repeatable_seed = args.sampled_candidate_seed
+    return f"""
+DROP TABLE IF EXISTS {table_name};
+
+CREATE UNLOGGED TABLE {table_name} AS
+SELECT
+    "Party"::text AS "Party",
+    count(*)::bigint AS sample_count,
+    greatest(1, round(count(*) / ({sample_percent}::numeric / 100.0))::bigint) AS estimated_count
+FROM "Dialog" TABLESAMPLE SYSTEM ({sample_percent}) REPEATABLE ({repeatable_seed})
+WHERE "Party" IS NOT NULL
+GROUP BY "Party";
+
+CREATE INDEX ON {table_name} (estimated_count DESC);
+CREATE INDEX ON {table_name} ("Party");
+ANALYZE {table_name};
+""".strip()
+
+
+def ensure_sampled_distribution_table(args: argparse.Namespace) -> None:
+    table_name = args.sampled_candidate_table
+    quoted_table_name = quote_qualified_identifier(table_name)
+    exists = fetch_single_column(
+        args,
+        f"SELECT (to_regclass({sql_literal(table_name)}) IS NOT NULL)::text;",
+        "sampled candidate distribution table existence query",
+    )
+    if exists != "true":
+        raise RuntimeError(
+            f"sampled candidate distribution table {table_name!r} does not exist.\n\n"
+            "Populate it before using "
+            f"--candidate-source {args.candidate_source}:\n\n"
+            f"{sampled_distribution_population_query(args)}"
+        )
+
+    has_rows = fetch_single_column(
+        args,
+        f"SELECT EXISTS (SELECT 1 FROM {quoted_table_name} LIMIT 1)::text;",
+        "sampled candidate distribution table emptiness query",
+    )
+    if has_rows == "true":
+        return
+
+    raise RuntimeError(
+        f"sampled candidate distribution table {table_name!r} is empty.\n\n"
+        "Populate it before using "
+        f"--candidate-source {args.candidate_source}:\n\n"
+        f"{sampled_distribution_population_query(args)}"
+    )
+
+
+def fetch_mcv_candidate_parties(args: argparse.Namespace) -> list[dict[str, str]]:
     ensure_party_mcv_stats(args)
     query = f"""
 SELECT "Party", estimated_count
@@ -330,6 +406,71 @@ ORDER BY estimated_count DESC
 LIMIT {int(args.party_limit)}
 """
     return copy_csv(args, query, "candidate party query")
+
+
+def fetch_sampled_candidate_parties(args: argparse.Namespace) -> list[dict[str, str]]:
+    ensure_sampled_distribution_table(args)
+    table_name = quote_qualified_identifier(args.sampled_candidate_table)
+    per_band_limit = max(1, math.ceil(args.party_limit / 4))
+    query = f"""
+WITH ranked AS (
+    SELECT
+        "Party",
+        estimated_count,
+        cume_dist() OVER (ORDER BY estimated_count DESC, "Party") AS rank_fraction
+    FROM {table_name}
+    WHERE "Party" IS NOT NULL
+      AND estimated_count > 0
+), banded AS (
+    SELECT
+        "Party",
+        estimated_count,
+        CASE
+            WHEN rank_fraction <= 0.01 THEN 'very_hot'
+            WHEN rank_fraction <= 0.05 THEN 'hot'
+            WHEN rank_fraction <= 0.25 THEN 'medium'
+            ELSE 'long_tail'
+        END AS distribution_band
+    FROM ranked
+), sampled AS (
+    SELECT
+        "Party",
+        estimated_count,
+        row_number() OVER (
+            PARTITION BY distribution_band
+            ORDER BY md5("Party" || {sql_literal(str(args.shuffle_seed))})
+        ) AS band_sample_rank
+    FROM banded
+)
+SELECT "Party", estimated_count
+FROM sampled
+WHERE band_sample_rank <= {per_band_limit}
+ORDER BY estimated_count DESC, "Party"
+LIMIT {int(args.party_limit)}
+"""
+    return copy_csv(args, query, "sampled candidate party query")
+
+
+def fetch_candidate_parties(args: argparse.Namespace) -> list[dict[str, str]]:
+    if args.candidate_source == "pg-stats-mcv":
+        return fetch_mcv_candidate_parties(args)
+    if args.candidate_source == "sampled-dialog-distribution":
+        return fetch_sampled_candidate_parties(args)
+    if args.candidate_source == "mcv-plus-sampled-dialog-distribution":
+        mcv_args = argparse.Namespace(**vars(args))
+        sampled_args = argparse.Namespace(**vars(args))
+        mcv_args.party_limit = max(1, args.party_limit // 2)
+        sampled_args.party_limit = max(1, args.party_limit - mcv_args.party_limit)
+        merged: dict[str, dict[str, str]] = {}
+        for row in fetch_sampled_candidate_parties(sampled_args):
+            merged[row["Party"]] = row
+        for row in fetch_mcv_candidate_parties(mcv_args):
+            merged[row["Party"]] = row
+        return sorted(
+            merged.values(),
+            key=lambda row: (-int(float(row["estimated_count"])), row["Party"]),
+        )
+    raise ValueError(f"unknown candidate source: {args.candidate_source}")
 
 
 def fetch_service_resources(args: argparse.Namespace, parties: list[tuple[str, str]]) -> dict[tuple[str, str], list[str]]:
@@ -1132,6 +1273,7 @@ def write_reports(
 
     report_json = {
         "config": serializable_config(args),
+        "command_line": command_line(args),
         "metadata": metadata,
         "sample_count": len(report_rows),
         "summary_by_variant_run": by_variant_run,
@@ -1148,6 +1290,7 @@ def write_reports(
         "",
         f"- Run directory: `{run_dir}`",
         f"- Generated at: `{utc_now_iso()}`",
+        f"- Command line: `{command_line(args)}`",
         f"- Dry run: `{args.dry_run}`",
         f"- Variants: `{len(variants)}`",
         f"- Cases: `{len(cases)}`",
@@ -1174,6 +1317,7 @@ def write_reports(
             "",
             "## Candidate Distribution",
             "",
+            f"- Candidate source: `{args.candidate_source}`",
             f"- Candidate parties fetched: `{len(candidates)}`",
             f"- Candidate parties with at least the minimum service bucket: `{len(selected_candidates)}`",
             f"- Benchmark cases generated from selected parties: `{len(cases)}`",
@@ -1274,6 +1418,7 @@ def serializable_config(args: argparse.Namespace) -> dict[str, Any]:
 
 def write_config(run_dir: Path, args: argparse.Namespace, variants: list[Variant]) -> None:
     config = serializable_config(args)
+    config["command_line"] = command_line(args)
     config["variants"] = [{"name": variant.name, "path": str(variant.path)} for variant in variants]
     (run_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -1311,7 +1456,34 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--party-buckets", type=parse_int_list, default=parse_int_list("1,5,20,100,500"))
     parser.add_argument("--service-buckets", type=parse_int_list, default=parse_int_list("1,5,20,100,500"))
     parser.add_argument("--permission-groups", type=int, default=1)
+    parser.add_argument(
+        "--candidate-source",
+        choices=[
+            "pg-stats-mcv",
+            "sampled-dialog-distribution",
+            "mcv-plus-sampled-dialog-distribution",
+        ],
+        default="pg-stats-mcv",
+        help="source used to discover party candidates",
+    )
     parser.add_argument("--candidate-strategy", choices=["stratified", "top"], default="stratified")
+    parser.add_argument(
+        "--sampled-candidate-table",
+        default="benchmark_dialog_party_sample",
+        help="unlogged table populated from Dialog TABLESAMPLE for sampled candidate sources",
+    )
+    parser.add_argument(
+        "--sampled-candidate-percent",
+        type=float,
+        default=0.1,
+        help="TABLESAMPLE SYSTEM percentage printed in the prerequisite population query",
+    )
+    parser.add_argument(
+        "--sampled-candidate-seed",
+        type=int,
+        default=12345,
+        help="TABLESAMPLE REPEATABLE seed printed in the prerequisite population query",
+    )
     parser.add_argument("--as-of", default=utc_now_iso())
     parser.add_argument("--psql", default="psql")
     parser.add_argument("--statement-timeout", default="0")
@@ -1330,6 +1502,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="validate template rendering and report parsing without connecting to PostgreSQL",
     )
     args = parser.parse_args(argv)
+    args.original_argv = list(argv)
 
     if not args.offline_self_test:
         missing = [
@@ -1350,6 +1523,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--runs-per-variant must be positive")
     if args.permission_groups != 1:
         parser.error("only --permission-groups 1 is supported by this implementation")
+    if args.sampled_candidate_percent <= 0 or args.sampled_candidate_percent > 100:
+        parser.error("--sampled-candidate-percent must be > 0 and <= 100")
+    try:
+        quote_qualified_identifier(args.sampled_candidate_table)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     args.queries_dir = str((ROOT / args.queries_dir).resolve()) if not Path(args.queries_dir).is_absolute() else args.queries_dir
     args.output_dir = str((ROOT / args.output_dir).resolve()) if not Path(args.output_dir).is_absolute() else args.output_dir
@@ -1496,6 +1675,7 @@ def main(argv: list[str]) -> int:
     write_config(run_dir, args, variants)
 
     print(f"Writing benchmark run to {run_dir}", file=sys.stderr)
+    print(f"Command line: {command_line(args)}", file=sys.stderr)
     print("Checking database metadata and selecting candidates...", file=sys.stderr)
     metadata = capture_metadata(args)
     all_candidates = build_candidates(args)
@@ -1508,7 +1688,7 @@ def main(argv: list[str]) -> int:
         eligible = sum(1 for candidate in all_candidates if candidate.selected)
         raise RuntimeError(
             "no benchmark cases were generated. "
-            f"Candidates from pg_stats: {len(all_candidates)}; "
+            f"Candidates from {args.candidate_source}: {len(all_candidates)}; "
             f"candidates with at least {min(args.service_buckets)} service resources: {eligible}; "
             f"maximum matched service resources for any candidate: {max_resources}. "
             "Lower --party-buckets/--service-buckets, increase --party-limit, or verify partyresource mappings."
