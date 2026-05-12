@@ -51,7 +51,7 @@ for ORG in "${ORGS[@]}"; do
   ORG_UPDATE_COUNT=0
 
   while true; do
-    RESULT=$(psql -h "$DATABASE_URL" -p "$DATABASE_PORT" -U "$DATABASE_USER" -d "$DATABASE_NAME" -f "./sql/UpdateDialogsFilterStrategy.sql" -q -t -A --pset=footer=off -v ON_ERROR_STOP=1 -v org=$ORG -v batchSize=$BATCH_SIZE)
+    RESULT=$(psql -h "$DATABASE_URL" -p "$DATABASE_PORT" -U "$DATABASE_USER" -d "$DATABASE_NAME" -f "./sql/BackfillDialogsFilterStrategy.sql" -q -t -A --pset=footer=off -v ON_ERROR_STOP=1 -v org=$ORG -v batchSize=$BATCH_SIZE)
 
     EXIT_CODE=$?
     if [ $EXIT_CODE -ne 0 ]; then
