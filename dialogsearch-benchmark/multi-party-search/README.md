@@ -27,9 +27,14 @@ Typical usage:
 Useful options:
 
 - `--queries-dir queries`: directory containing query templates.
+- `--queries-glob "*.sql"`: glob within `--queries-dir` selecting which query
+  templates to include for this run.
 - `--output-dir runs`: directory where timestamped run folders are written.
 - `--party-buckets 1,5,20,100,500`: party counts to test.
 - `--service-buckets 1,5,20,100,500`: service counts to test.
+- `--buckets "1;20,5;50,100;20"`: explicit party/service bucket pairs.
+  When provided, this overrides the Cartesian product from `--party-buckets`
+  and `--service-buckets`.
 - `--cases N`: number of generated benchmark cases.
 - `--passes N`: number of full sweeps over all cases.
 - `--runs-per-variant N`: immediate repeats per variant for each case/pass.

@@ -101,6 +101,47 @@ def parse_int_list(value: str) -> list[int]:
     return sorted(set(values))
 
 
+def parse_bucket_pairs(value: str) -> list[tuple[int, int]]:
+    pairs: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        left, sep, right = part.partition(";")
+        if not sep:
+            raise argparse.ArgumentTypeError("bucket pairs must use PARTY;SERVICE")
+        try:
+            party_count = int(left.strip())
+            service_count = int(right.strip())
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("bucket pair values must be integers") from exc
+        if party_count <= 0 or service_count <= 0:
+            raise argparse.ArgumentTypeError("bucket pair values must be positive integers")
+        pair = (party_count, service_count)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        pairs.append(pair)
+    if not pairs:
+        raise argparse.ArgumentTypeError("at least one bucket pair is required")
+    return pairs
+
+
+def format_bucket_pairs(pairs: list[tuple[int, int]]) -> str:
+    return ",".join(f"{party_count};{service_count}" for party_count, service_count in pairs)
+
+
+def active_bucket_pairs(args: argparse.Namespace) -> list[tuple[int, int]]:
+    if args.buckets:
+        return args.buckets
+    return [
+        (party_bucket, service_bucket)
+        for party_bucket in args.party_buckets
+        for service_bucket in args.service_buckets
+    ]
+
+
 def relpath(path: Path, base: Path) -> str:
     try:
         return str(path.relative_to(base))
@@ -165,12 +206,14 @@ def fetch_single_column(args: argparse.Namespace, sql: str, context: str) -> str
     return stdout.strip()
 
 
-def load_variants(queries_dir: Path) -> list[Variant]:
+def load_variants(queries_dir: Path, queries_glob: str) -> list[Variant]:
     if not queries_dir.exists():
         raise FileNotFoundError(f"queries directory does not exist: {queries_dir}")
 
     variants: list[Variant] = []
-    for path in sorted(queries_dir.glob("*.sql")):
+    for path in sorted(queries_dir.glob(queries_glob)):
+        if not path.is_file():
+            continue
         template = path.read_text(encoding="utf-8")
         stripped = template.lstrip()
         if stripped.upper().startswith("EXPLAIN"):
@@ -184,7 +227,7 @@ def load_variants(queries_dir: Path) -> list[Variant]:
         variants.append(Variant(path.stem, path, template))
 
     if not variants:
-        raise FileNotFoundError(f"no *.sql files found in {queries_dir}")
+        raise FileNotFoundError(f"no query files matching {queries_glob!r} found in {queries_dir}")
     return variants
 
 
@@ -516,7 +559,7 @@ def build_candidates(args: argparse.Namespace) -> list[Candidate]:
         if key is not None
     ]
     resource_map = fetch_service_resources(args, parties)
-    min_bucket = min(args.service_buckets)
+    min_bucket = min(service_bucket for _, service_bucket in active_bucket_pairs(args))
 
     candidates: list[Candidate] = []
     for row in rows:
@@ -575,23 +618,22 @@ def has_enough_selected_candidates(
     selected: list[Candidate],
     eligible: list[Candidate],
 ) -> bool:
-    target_party_count = min(max(args.party_buckets), len(eligible))
+    target_party_count = min(max(party_bucket for party_bucket, _ in active_bucket_pairs(args)), len(eligible))
     return len(selected) >= target_party_count and count_cases_for_candidates(args, selected) >= args.cases
 
 
 def count_cases_for_candidates(args: argparse.Namespace, candidates: list[Candidate]) -> int:
     count = 0
     for candidate in candidates:
-        for party_bucket in args.party_buckets:
+        for party_bucket, service_bucket in active_bucket_pairs(args):
             parties = choose_case_parties(args, candidates, candidate, party_bucket)
             if len(parties) < party_bucket:
                 continue
             service_pool = service_union(parties)
-            for service_bucket in args.service_buckets:
-                if len(service_pool) >= service_bucket:
-                    count += 1
-                if count >= args.cases:
-                    return count
+            if len(service_pool) >= service_bucket:
+                count += 1
+            if count >= args.cases:
+                return count
     return count
 
 
@@ -664,14 +706,13 @@ def build_payload(parties: tuple[str, ...], services: tuple[str, ...]) -> str:
 
 def count_bucket_cases(args: argparse.Namespace, candidates: list[Candidate], seed: Candidate) -> int:
     count = 0
-    for party_bucket in args.party_buckets:
+    for party_bucket, service_bucket in active_bucket_pairs(args):
         parties = choose_case_parties(args, candidates, seed, party_bucket)
         if len(parties) < party_bucket:
             continue
         service_pool = service_union(parties)
-        for service_bucket in args.service_buckets:
-            if len(service_pool) >= service_bucket:
-                count += 1
+        if len(service_pool) >= service_bucket:
+            count += 1
     return count
 
 
@@ -689,11 +730,7 @@ def build_cases(args: argparse.Namespace, candidates: list[Candidate]) -> list[B
     if not candidates:
         return cases
 
-    bucket_pairs = [
-        (party_bucket, service_bucket)
-        for party_bucket in args.party_buckets
-        for service_bucket in args.service_buckets
-    ]
+    bucket_pairs = active_bucket_pairs(args)
     max_attempts = max(args.cases * len(bucket_pairs) * 2, len(candidates) * len(bucket_pairs))
     seen: set[tuple[str, int, int]] = set()
 
@@ -1293,9 +1330,11 @@ def write_reports(
         f"- Command line: `{command_line(args)}`",
         f"- Dry run: `{args.dry_run}`",
         f"- Variants: `{len(variants)}`",
+        f"- Queries glob: `{args.queries_glob}`",
         f"- Cases: `{len(cases)}`",
         f"- Passes: `{args.passes}`",
         f"- Runs per variant per case: `{args.runs_per_variant}`",
+        f"- Bucket pairs: `{format_bucket_pairs(active_bucket_pairs(args))}`",
         f"- As-of timestamp: `{args.as_of}`",
         f"- Shuffle seed: `{args.shuffle_seed}`",
         "",
@@ -1410,6 +1449,10 @@ def write_reports(
 
 def serializable_config(args: argparse.Namespace) -> dict[str, Any]:
     config = vars(args).copy()
+    config["active_bucket_pairs"] = [
+        {"party_count": party_count, "service_count": service_count}
+        for party_count, service_count in active_bucket_pairs(args)
+    ]
     for key, value in list(config.items()):
         if isinstance(value, Path):
             config[key] = str(value)
@@ -1443,6 +1486,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--dbname")
     parser.add_argument("--user")
     parser.add_argument("--queries-dir", default="queries")
+    parser.add_argument("--queries-glob", default="*.sql", help="glob within --queries-dir selecting query templates")
     parser.add_argument("--output-dir", default="runs")
     parser.add_argument("--party-limit", type=int, default=5000)
     parser.add_argument(
@@ -1455,6 +1499,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--runs-per-variant", type=int, default=2)
     parser.add_argument("--party-buckets", type=parse_int_list, default=parse_int_list("1,5,20,100,500"))
     parser.add_argument("--service-buckets", type=parse_int_list, default=parse_int_list("1,5,20,100,500"))
+    parser.add_argument(
+        "--buckets",
+        type=parse_bucket_pairs,
+        help='explicit party/service bucket pairs, e.g. "1;20,5;50,100;20"',
+    )
     parser.add_argument("--permission-groups", type=int, default=1)
     parser.add_argument(
         "--candidate-source",
@@ -1536,7 +1585,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def run_offline_self_test(args: argparse.Namespace) -> int:
-    variants = load_variants(Path(args.queries_dir))
+    variants = load_variants(Path(args.queries_dir), args.queries_glob)
+    if parse_bucket_pairs("1;20,5;50,100;20,5;50") != [(1, 20), (5, 50), (100, 20)]:
+        raise RuntimeError("offline self-test failed bucket pair parsing")
     parties = (
         "urn:altinn:organization:identifier-no:911612860",
         "urn:altinn:organization:identifier-no:312240505",
@@ -1671,7 +1722,7 @@ def main(argv: list[str]) -> int:
     output_dir = Path(args.output_dir)
     run_dir = create_run_dir(output_dir)
 
-    variants = load_variants(queries_dir)
+    variants = load_variants(queries_dir, args.queries_glob)
     write_config(run_dir, args, variants)
 
     print(f"Writing benchmark run to {run_dir}", file=sys.stderr)
@@ -1686,10 +1737,11 @@ def main(argv: list[str]) -> int:
     if not cases:
         max_resources = max((len(candidate.service_resources) for candidate in all_candidates), default=0)
         eligible = sum(1 for candidate in all_candidates if candidate.selected)
+        min_service_bucket = min(service_bucket for _, service_bucket in active_bucket_pairs(args))
         raise RuntimeError(
             "no benchmark cases were generated. "
             f"Candidates from {args.candidate_source}: {len(all_candidates)}; "
-            f"candidates with at least {min(args.service_buckets)} service resources: {eligible}; "
+            f"candidates with at least {min_service_bucket} service resources: {eligible}; "
             f"maximum matched service resources for any candidate: {max_resources}. "
             "Lower --party-buckets/--service-buckets, increase --party-limit, or verify partyresource mappings."
         )
