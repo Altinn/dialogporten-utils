@@ -29,6 +29,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PG_TOKEN_SCRIPT="${SCRIPT_DIR}/pg-token.sh"
 readonly DB_NAME="dialogporten"
 
+# How to activate write/admin access via Entra PIM. Read is standing membership
+# (no PIM); write/admin are PIM-eligible and activated on demand.
+# TODO: replace with the canonical org PIM activation URL / az command.
+readonly PIM_ACTIVATION_HINT="Activate it in Entra PIM (Privileged Identity Management → Groups)."
+
 # Canonical env values (match forward.sh). yt01 = perf, lives in the test
 # subscription; low focus for now but included for completeness.
 readonly VALID_ENVIRONMENTS=("test" "yt01" "staging" "prod")
@@ -406,11 +411,22 @@ main() {
     local is_member
     is_member="$("$AZ" ad group member check --group "$group" --member-id "$my_oid" --query value -o tsv 2>/dev/null || true)"
     if [ "$is_member" = "false" ]; then
-      log_error "Identity '${me}' is NOT a member of group '${group}'."
-      log_info  "Wrong Azure account for $(env_label "$environment"). If you're already logged in as the right one:"
-      echo      "    az account list -o table                  # find a subscription under the right account"
-      echo      "    az account set --subscription \"<name>\"     # switches the active account"
-      log_info  "Otherwise sign in:  az login"
+      log_error "Identity '${me}' is NOT currently in group '${group}'."
+      # The check can't tell "wrong account" from "not PIM-activated", so lead
+      # with the likeliest cause per tier. read = standing membership (no PIM);
+      # write/admin = PIM-activated on demand.
+      if [ "$tier" = "read" ]; then
+        log_info  "Read access is standing membership, so this is most likely the wrong Azure account."
+        log_info  "If you're already logged in as the right one:"
+        echo      "    az account list -o table                  # find a subscription under the right account"
+        echo      "    az account set --subscription \"<name>\"     # switches the active account"
+        log_info  "Otherwise sign in:  az login"
+      else
+        log_info  "${BOLD}${tier}${NC} access is granted on demand via PIM — most likely you haven't activated"
+        log_info  "it yet (or your activation expired). ${PIM_ACTIVATION_HINT}"
+        log_info  "If you have already activated and are still rejected, check you're on the right account:"
+        echo      "    az account list -o table   /   az account set --subscription \"<name>\"   /   az login"
+      fi
       exit 1
     elif [ "$is_member" = "true" ]; then
       log_success "Membership confirmed: ${me} ∈ ${group}"
