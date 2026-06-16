@@ -245,6 +245,11 @@ Options:
     -p, --port PORT       Local port to bind on localhost (127.0.0.1)
                           If not specified, will use the default port for the selected database
 
+    -s, --shell           Open an interactive shell on the jumper (prints the Ubuntu MOTD;
+                          exit to close). Default is port-forward only (-N): no shell, no
+                          MOTD, tunnel holds the terminal — press Ctrl-C to stop. Use this
+                          only if you need to run commands ON the jumper itself.
+
     -h, --help           Show this help message
 
 Prerequisites:
@@ -596,20 +601,32 @@ get_redis_info() {
     echo "connection_string=redis://:<retrieve-password-from-keyvault>@${hostname}:${local_port:-$port}"
 }
 
-# Set up SSH tunnel to the database
+# Set up SSH tunnel to the database.
+# Default (shell_mode=false): -N port-forward only — no remote shell, no Ubuntu
+#   MOTD; the tunnel holds the terminal, press Ctrl-C to stop.
+# shell_mode=true (--shell): -tt interactive jumper shell (prints the MOTD);
+#   exit the shell to close the tunnel. Only needed to run commands ON the jumper.
 setup_ssh_tunnel() {
     local env=$1
     local hostname=$2
     local remote_port=$3
     local local_port=${4:-$remote_port}
+    local shell_mode=${5:-false}
 
-    log_info "Starting SSH tunnel..."
     log_info "Connecting to ${hostname}:${remote_port} via local port ${local_port}"
-
-    az ssh vm \
-        -g "$(get_resource_group "$env")" \
-        -n "$(get_jumper_vm_name "$env")" \
-        -- -tt -L "${local_port}:${hostname}:${remote_port}"
+    if [ "$shell_mode" = "true" ]; then
+        log_info "Interactive jumper shell; type ${BOLD}exit${NC} to close the tunnel."
+        az ssh vm \
+            -g "$(get_resource_group "$env")" \
+            -n "$(get_jumper_vm_name "$env")" \
+            -- -tt -L "${local_port}:${hostname}:${remote_port}"
+    else
+        log_success "Tunnel up on ${BOLD}localhost:${local_port}${NC} — press ${BOLD}Ctrl-C${NC} to stop."
+        az ssh vm \
+            -g "$(get_resource_group "$env")" \
+            -n "$(get_jumper_vm_name "$env")" \
+            -- -N -L "${local_port}:${hostname}:${remote_port}"
+    fi
 }
 
 # =========================================================================
@@ -641,6 +658,7 @@ main() {
     local db_type=$2
     local local_port=$3
     local name_override=${4:-}
+    local shell_mode=${5:-false}
 
     # Add trap to handle script termination
     trap 'echo -e "\n${YELLOW}⚠${NC} Operation interrupted"; exit 130' INT TERM
@@ -738,7 +756,11 @@ Local Port:  ${BOLD}${local_port:-"<default>"}${NC}"
         exit 1
     fi
 
-    # Print connection details
+    # Configure JIT access before proceeding with database operations
+    configure_jit_access "$environment" "$subscription_id"
+
+    # Print connection details LAST (right before the tunnel), so the box isn't
+    # buried under the JIT / IP-detection / VM-lookup output above it.
     print_box "$(to_upper "$db_type") Connection Info" "\
 Server:     ${hostname}
 Local Port: ${local_port:-$port}
@@ -747,11 +769,14 @@ Remote Port: ${port}
 Connection String:
 ${BOLD}${connection_string/localhost/$'\n'localhost}${NC}"
 
-    # Configure JIT access before proceeding with database operations
-    configure_jit_access "$environment" "$subscription_id"
+    # For postgres, point the dev at the token helper (run locally, separate tab).
+    if [ "$db_type" = "postgres" ]; then
+        echo
+        log_info "Next: in a ${BOLD}new terminal${NC}, run ${BOLD}db-login.sh${NC} to get a DB token for pgAdmin/psql/Rider."
+    fi
 
     # Set up the SSH tunnel
-    setup_ssh_tunnel "$environment" "${hostname}" "${port}" "${local_port:-$port}"
+    setup_ssh_tunnel "$environment" "${hostname}" "${port}" "${local_port:-$port}" "${shell_mode}"
 }
 
 # =========================================================================
@@ -763,6 +788,7 @@ environment=""
 db_type=""
 local_port=""
 name_override=""
+shell_mode="false"   # default: port-forward only (-N), no jumper shell / no MOTD
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -787,6 +813,10 @@ while [[ $# -gt 0 ]]; do
             local_port="$2"
             shift 2
             ;;
+        -s|--shell)
+            shell_mode="true"
+            shift
+            ;;
         -h|--help)
             print_help
             exit 0
@@ -804,4 +834,4 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Call main with all arguments
-main "${environment:-}" "${db_type:-}" "${local_port:-}" "${name_override:-}"
+main "${environment:-}" "${db_type:-}" "${local_port:-}" "${name_override:-}" "${shell_mode}"
