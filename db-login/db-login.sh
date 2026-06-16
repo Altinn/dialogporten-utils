@@ -82,6 +82,25 @@ log_warning() { echo -e "${YELLOW}⚠${NC} $1"; }
 log_error()   { echo -e "${RED}✖${NC} $1" >&2; }
 log_title()   { echo -e "\n${BOLD}${CYAN}$1${NC}"; }
 
+# Print a formatted box with title and content (ANSI-aware; mirrors forward.sh
+# but builds borders with a printf loop instead of `tr`, which mangles the
+# multibyte box chars when LANG is unset / C locale).
+print_box() {
+  local title="$1" content="$2" width=72 padding=2
+  get_visible_length() { local str; str=$(printf "%b" "$1" | sed 's/\x1b\[[0-9;]*m//g'); echo "${#str}"; }
+  _rule() { local n=$1 i; for ((i=0; i<n; i++)); do printf '─'; done; }
+  _row() { # $1 = content (may contain ANSI); pads to width, never negative
+    local vlen pad; vlen=$(get_visible_length "$1"); pad=$((width - vlen - padding))
+    [ "$pad" -lt 0 ] && pad=0
+    printf "│%-${padding}s%b%*s│\n" " " "$1" "$pad" ""
+  }
+  printf "╭"; _rule "$width"; printf "╮\n"
+  _row "$title"
+  _row ""
+  while IFS= read -r line; do _row "$line"; done <<< "$content"
+  printf "╰"; _rule "$width"; printf "╯\n"
+}
+
 # locate az
 AZ=""
 for cand in "${AZ_BIN:-}" /opt/homebrew/bin/az /usr/local/bin/az "$(command -v az 2>/dev/null || true)"; do
@@ -200,6 +219,7 @@ main() {
     else
       log_warning "Could not verify group membership (continuing; PostgreSQL will enforce it)."
     fi
+    echo
   fi
 
   # --- client selection ---------------------------------------------------
@@ -207,13 +227,7 @@ main() {
     client=$(prompt_choice "How will you connect? (pgadmin recommended)" "pgadmin" "rider" "psql" "raw")
   fi
 
-  log_title "Connection — ${environment} / ${tier}"
-  echo -e "  Host:     ${BOLD}localhost${NC}"
-  echo -e "  Port:     ${BOLD}${port}${NC}   (from forward.sh)"
-  echo -e "  Database: ${BOLD}${DB_NAME}${NC}"
-  echo -e "  Username: ${BOLD}${group}${NC}"
   echo
-
   case "$client" in
     pgadmin) handoff_pgadmin "$port" "$group" "$environment" "$tier" ;;
     rider)   handoff_clipboard "rider" "$port" "$group" ;;
@@ -229,25 +243,25 @@ handoff_pgadmin() {
   local server_name="Dialogporten ${environment} ${tier}"
   log_success "pgAdmin ${GREEN}(recommended)${NC} — set up a server ${BOLD}once${NC}; it then auto-refreshes the token."
   echo
-  echo -e "  Register a new server in pgAdmin with these values:"
+  print_box "${BOLD}pgAdmin — register a new server${NC}  (${environment} / ${tier})" "\
+${CYAN}${BOLD}General tab${NC}
+  Name           ${BOLD}${server_name}${NC}
+  Connect now?   ${YELLOW}Off${NC}  ${YELLOW}(must be disabled to save with no password)${NC}
+
+${CYAN}${BOLD}Connection tab${NC}
+  Host                  ${BOLD}localhost${NC}
+  Port                  ${BOLD}${port}${NC}
+  Maintenance database  ${BOLD}${DB_NAME}${NC}
+  Username              ${BOLD}${group}${NC}
+  Password              ${YELLOW}(leave blank)${NC}
+
+${CYAN}${BOLD}Advanced tab${NC}
+  Password exec expiration (sec)  ${BOLD}3600${NC}
+  Password exec command:
+    ${BOLD}${PG_TOKEN_SCRIPT}${NC}"
   echo
-  echo -e "  ${CYAN}${BOLD}General tab${NC}"
-  echo -e "    Name:          ${BOLD}${server_name}${NC}"
-  echo -e "    Connect now?   ${YELLOW}Off — must be disabled to save the server with no password${NC}"
-  echo
-  echo -e "  ${CYAN}${BOLD}Connection tab${NC}"
-  echo -e "    Host:                  ${BOLD}localhost${NC}"
-  echo -e "    Port:                  ${BOLD}${port}${NC}"
-  echo -e "    Maintenance database:  ${BOLD}${DB_NAME}${NC}"
-  echo -e "    Username:              ${BOLD}${group}${NC}"
-  echo -e "    Password:              ${YELLOW}(leave blank)${NC}"
-  echo
-  echo -e "  ${CYAN}${BOLD}Advanced tab${NC}"
-  echo -e "    Password exec command:           ${BOLD}${PG_TOKEN_SCRIPT}${NC}"
-  echo -e "    Password exec expiration (sec):  ${BOLD}3600${NC}"
-  echo
-  echo -e "  After saving, connect — pgAdmin runs the token script and re-runs it"
-  echo -e "  before expiry, so you won't need to paste tokens again."
+  log_info "After saving, connect — pgAdmin runs the token script and re-runs it"
+  log_info "before expiry, so you won't need to paste tokens again."
 }
 
 # --- psql: offer to launch directly ---------------------------------------
@@ -265,20 +279,22 @@ handoff_clipboard() {
   local kind=$1 port=$2 group=$3
   local token; token="$("$PG_TOKEN_SCRIPT" 2>/dev/null || true)"
   [ -z "$token" ] && { log_error "Failed to get token (az login?)."; exit 1; }
+  print_box "${BOLD}Connection details${NC}  (paste token as the password)" "\
+  Host      ${BOLD}localhost${NC}
+  Port      ${BOLD}${port}${NC}
+  Database  ${BOLD}${DB_NAME}${NC}
+  Username  ${BOLD}${group}${NC}
+  Password  ${YELLOW}<the token on your clipboard>${NC}"
+  echo
   if command -v pbcopy >/dev/null 2>&1; then
     printf '%s' "$token" | pbcopy
     log_success "Token copied to clipboard (not shown). Valid ~75 min."
   else
-    log_warning "pbcopy not found; cannot copy to clipboard on this OS."
+    log_warning "pbcopy not found; copy the token manually (not shown for safety)."
   fi
   if [ "$kind" = "rider" ]; then
-    cat <<EOF
-  In Rider's Database tool: add a PostgreSQL data source with the Host/Port/
-  Database/Username above, and PASTE the token as the password. Rider does not
-  auto-refresh — re-run this script for a fresh token when it expires.
-EOF
-  else
-    log_info "Use the token as the password with the connection details above."
+    log_info "Rider: add a PostgreSQL data source with the above, paste the token as"
+    log_info "the password. Rider does not auto-refresh — re-run this for a fresh token."
   fi
 }
 
