@@ -236,13 +236,15 @@ Usage: $0 [-e ENV] [-t TIER] [-c CLIENT]
 
   -e, --env         ${VALID_ENVIRONMENTS[*]}
   -t, --tier        ${VALID_TIERS[*]}   (read=SELECT, write=DML, admin=DDL)
-  -c, --client      pgadmin | rider | psql | raw   (default: prompt; pgadmin recommended)
+  -c, --client      pgadmin | rider | psql | raw   (default: prompt)
   --export-pgadmin  Emit a pgAdmin Import/Export servers JSON to stdout (all envs/tiers,
                     per-env groups, token exec command wired to this machine). No prompts.
+                    Recommended for pgAdmin users: import once, then pgAdmin auto-refreshes
+                    the token. (Interactive equivalent: the last client menu option.)
   --no-admin        With --export-pgadmin: omit the admin/DDL tier servers.
   -h, --help
 
-Interactive when flags are omitted. Mirrors forward.sh's env-first flow.
+Interactive when flags are omitted (asks client, then environment, then tier).
 
 Import the generated file (CLI; additive by default), e.g.:
   PYBIN="/Applications/pgAdmin 4.app/Contents/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
@@ -289,7 +291,7 @@ main() {
   # --- client selection (first: option to set up all pgAdmin servers) -----
   if [ -z "$client" ]; then
     local pick
-    pick=$(prompt_choice "How will you connect? (pgadmin recommended)" \
+    pick=$(prompt_choice "How will you connect?  (pgAdmin users: option 5 sets up everything once)" \
       "pgadmin" "rider" "psql" "raw" "set up all pgAdmin servers (one-time import file)")
     case "$pick" in
       "set up all pgAdmin servers"*) client="export" ;;
@@ -352,7 +354,7 @@ main() {
 
   echo
   case "$client" in
-    pgadmin) handoff_pgadmin "$port" "$group" "$environment" "$tier" ;;
+    pgadmin) handoff_clipboard "pgadmin" "$port" "$group" ;;
     rider)   handoff_clipboard "rider" "$port" "$group" ;;
     psql)    handoff_psql "$port" "$group" ;;
     raw)     handoff_clipboard "raw" "$port" "$group" ;;
@@ -378,65 +380,45 @@ EOF
   log_info "Add ${BOLD}--replace${NC} to the load-servers command to update servers you imported before."
 }
 
-# --- pgAdmin: setup-helper (the recommended path) --------------------------
-handoff_pgadmin() {
-  local port=$1 group=$2 environment=$3 tier=$4
-  local server_name="Dialogporten ${environment} ${tier}"
-  log_success "pgAdmin ${GREEN}(recommended)${NC} — set up a server ${BOLD}once${NC}; it then auto-refreshes the token."
-  echo
-  print_box "${BOLD}pgAdmin — register a new server${NC}  (${environment} / ${tier})" "\
-${CYAN}${BOLD}General tab${NC}
-  Name           ${BOLD}${server_name}${NC}
-  Connect now?   ${YELLOW}Off${NC}  ${YELLOW}(must be disabled to save with no password)${NC}
-
-${CYAN}${BOLD}Connection tab${NC}
-  Host                  ${BOLD}localhost${NC}
-  Port                  ${BOLD}${port}${NC}
-  Maintenance database  ${BOLD}${DB_NAME}${NC}
-  Username              ${BOLD}${group}${NC}
-  Password              ${YELLOW}(leave blank)${NC}
-
-${CYAN}${BOLD}Advanced tab${NC}
-  Password exec expiration (sec)  ${BOLD}3600${NC}
-  Password exec command:
-    ${BOLD}${PG_TOKEN_SCRIPT}${NC}"
-  echo
-  log_info "After saving, connect — pgAdmin runs the token script and re-runs it"
-  log_info "before expiry, so you won't need to paste tokens again."
-}
-
-# --- psql: offer to launch directly ---------------------------------------
+# --- psql: launch directly ------------------------------------------------
 handoff_psql() {
   local port=$1 group=$2
   local token; token="$("$PG_TOKEN_SCRIPT" 2>/dev/null || true)"
-  [ -z "$token" ] && { log_error "Failed to get token (az login?)."; exit 1; }
-  log_info "Launching psql (token valid ~75 min for this session)..."
+  [ -z "$token" ] && { log_error "Failed to get a token. Is your Azure session active? Run: az login"; exit 1; }
+  log_info "Launching psql..."
   PGPASSWORD="$token" PGUSER="$group" \
     psql "host=localhost port=${port} dbname=${DB_NAME} sslmode=require" || true
 }
 
-# --- Rider / raw: copy token to clipboard, never echo it -------------------
+# --- pgAdmin / Rider / raw: connection details + token on the clipboard ----
+# Manual one-off connection. For pgAdmin auto-refresh (no token pasting), use
+# the "set up all pgAdmin servers" option instead.
 handoff_clipboard() {
   local kind=$1 port=$2 group=$3
   local token; token="$("$PG_TOKEN_SCRIPT" 2>/dev/null || true)"
-  [ -z "$token" ] && { log_error "Failed to get token (az login?)."; exit 1; }
-  print_box "${BOLD}Connection details${NC}  (paste token as the password)" "\
+  [ -z "$token" ] && { log_error "Failed to get a token. Is your Azure session active? Run: az login"; exit 1; }
+  print_box "Connection details" "\
   Host      ${BOLD}localhost${NC}
   Port      ${BOLD}${port}${NC}
   Database  ${BOLD}${DB_NAME}${NC}
   Username  ${BOLD}${group}${NC}
-  Password  ${YELLOW}<the token on your clipboard>${NC}"
+  Password  ${YELLOW}paste the token (copied to your clipboard)${NC}"
   echo
   if command -v pbcopy >/dev/null 2>&1; then
     printf '%s' "$token" | pbcopy
-    log_success "Token copied to clipboard (not shown). Valid ~75 min."
+    log_success "Token copied to clipboard. Valid ~75 min; re-run this for a fresh one."
   else
-    log_warning "pbcopy not found; copy the token manually (not shown for safety)."
+    log_warning "pbcopy not found — copy the token manually (not shown here for safety)."
   fi
-  if [ "$kind" = "rider" ]; then
-    log_info "Rider: add a PostgreSQL data source with the above, paste the token as"
-    log_info "the password. Rider does not auto-refresh — re-run this for a fresh token."
-  fi
+  case "$kind" in
+    pgadmin)
+      log_info "pgAdmin: register a server with the details above; paste the token as the password."
+      log_info "For auto-refresh (no pasting), use the 'set up all pgAdmin servers' option instead."
+      ;;
+    rider)
+      log_info "Rider: add a PostgreSQL data source with the details above; paste the token as the password."
+      ;;
+  esac
 }
 
 main "$@"
