@@ -419,3 +419,6 @@ FodyWeavers.xsd
 
 # Jetbrains Rider ignored files
 .idea/
+
+# generated pgAdmin server import file (per-machine, from db-login.sh)
+dp-pgadmin-servers.json
