@@ -342,7 +342,10 @@ main() {
     is_member="$("$AZ" ad group member check --group "$group" --member-id "$my_oid" --query value -o tsv 2>/dev/null || true)"
     if [ "$is_member" = "false" ]; then
       log_error "Identity '${me}' is NOT a member of group '${group}'."
-      log_info  "You are likely on the wrong Azure account for $(env_label "$environment"). Switch with: az login"
+      log_info  "Wrong Azure account for $(env_label "$environment"). If you're already logged in as the right one:"
+      echo      "    az account list -o table                  # find a subscription under the right account"
+      echo      "    az account set --subscription \"<name>\"     # switches the active account"
+      log_info  "Otherwise sign in:  az login"
       exit 1
     elif [ "$is_member" = "true" ]; then
       log_success "Membership confirmed: ${me} ∈ ${group}"
