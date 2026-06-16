@@ -37,17 +37,6 @@ readonly VALID_TIERS=("read" "write" "admin")
 # NOTE: stock macOS ships bash 3.2 (no associative arrays), and forward.sh is
 # bash-3.2 compatible, so we use case-based lookups instead of `declare -A`.
 
-# env -> friendly label (codename) for prompts.
-env_label() {
-  case "$1" in
-    test)    echo "test (AT23)" ;;
-    yt01)    echo "perf (YT01)" ;;
-    staging) echo "staging (TT02)" ;;
-    prod)    echo "prod" ;;
-    *)       echo "$1" ;;
-  esac
-}
-
 # env -> default local tunnel port (must match how you ran forward.sh).
 env_port() {
   case "$1" in
@@ -102,10 +91,9 @@ done
 # =========================================================================
 # Prompt helper (numbered select with optional default)
 # =========================================================================
-prompt_index() {
-  # $1=label (display strings shown), rest=display options.
-  # Echoes the 1-based INDEX chosen (caller maps it to a canonical value).
-  # Adds a trailing blank line for breathing room.
+prompt_choice() {
+  # $1=label, rest=options; echoes the chosen value.
+  # Colored prompt + trailing blank line for breathing room.
   local label=$1; shift
   local options=("$@") i sel
   trap 'echo -e "\nCancelled" >&2; exit 130' INT
@@ -115,7 +103,7 @@ prompt_index() {
     read -rp "Select (1-${#options[@]}): " sel
     if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#options[@]}" ]; then
       echo "" >&2          # breathing room after the block
-      echo "$sel"; return
+      echo "${options[$((sel-1))]}"; return
     fi
     log_error "Invalid selection."
   done
@@ -175,19 +163,15 @@ main() {
   log_info "Active Azure identity: ${BOLD}${me}${NC}  (token will be attributed to this user)"
   echo
 
-  # --- environment (show friendly labels, return canonical value) ---------
+  # --- environment --------------------------------------------------------
   if [ -z "$environment" ]; then
-    local env_labels=() e
-    for e in "${VALID_ENVIRONMENTS[@]}"; do env_labels+=("$(env_label "$e")"); done
-    local idx; idx=$(prompt_index "Select environment:" "${env_labels[@]}")
-    environment="${VALID_ENVIRONMENTS[$((idx-1))]}"
+    environment=$(prompt_choice "Select environment:" "${VALID_ENVIRONMENTS[@]}")
   fi
   validate_in "$environment" "${VALID_ENVIRONMENTS[@]}" || { log_error "Invalid env: $environment"; exit 1; }
 
   # --- tier ---------------------------------------------------------------
   if [ -z "$tier" ]; then
-    local idx; idx=$(prompt_index "Select access tier:" "${VALID_TIERS[@]}")
-    tier="${VALID_TIERS[$((idx-1))]}"
+    tier=$(prompt_choice "Select access tier:" "${VALID_TIERS[@]}")
   fi
   validate_in "$tier" "${VALID_TIERS[@]}" || { log_error "Invalid tier: $tier"; exit 1; }
 
@@ -220,9 +204,7 @@ main() {
 
   # --- client selection ---------------------------------------------------
   if [ -z "$client" ]; then
-    local clients=("pgadmin" "rider" "psql" "raw") idx
-    idx=$(prompt_index "How will you connect? (pgadmin recommended)" "${clients[@]}")
-    client="${clients[$((idx-1))]}"
+    client=$(prompt_choice "How will you connect? (pgadmin recommended)" "pgadmin" "rider" "psql" "raw")
   fi
 
   log_title "Connection — ${environment} / ${tier}"
