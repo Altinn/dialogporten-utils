@@ -396,11 +396,9 @@ main() {
   port="$(env_port "$environment")"; [ -z "$port" ] && port=5432
   [ -z "$group" ] && { log_error "No group configured for ${environment}:${tier}"; exit 1; }
 
-  # --- prod guard ---------------------------------------------------------
-  if [ "$environment" = "prod" ]; then
-    log_warning "You are targeting ${BOLD}PROD${NC}."
-    read -rp "Type 'prod' to continue: " c; [ "$c" = "prod" ] || { log_warning "Aborted."; exit 0; }
-  fi
+  # No prod confirmation prompt: prod access is gated by PIM activation (MFA +
+  # justification + time-bound), and the membership check below fails clearly if
+  # you haven't activated. A "type prod to continue" prompt would be theater.
 
   # --- best-effort membership pre-check (terminal CAN show this) ----------
   local my_oid; my_oid="$("$AZ" ad signed-in-user show --query id -o tsv 2>/dev/null || true)"
