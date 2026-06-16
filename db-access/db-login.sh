@@ -239,7 +239,8 @@ Usage: $0 [-e ENV] [-t TIER] [-c CLIENT]
 
   -e, --env         ${VALID_ENVIRONMENTS[*]}
   -t, --tier        ${VALID_TIERS[*]}   (read=SELECT, write=DML, admin=DDL)
-  -c, --client      pgadmin | rider | psql | raw   (default: prompt)
+  -c, --client      token | psql   (default: prompt; 'token' = copy a token to paste into
+                    pgAdmin/Rider/etc. Old values pgadmin|rider|raw are accepted as 'token'.)
   --export-pgadmin  Emit a pgAdmin Import/Export servers JSON to stdout (all envs/tiers,
                     per-env groups, token exec command wired to this machine). No prompts.
                     Recommended for pgAdmin users: import once, then pgAdmin auto-refreshes
@@ -294,11 +295,12 @@ main() {
   # --- client selection (first: option to set up all pgAdmin servers) -----
   if [ -z "$client" ]; then
     local pick
-    pick=$(prompt_choice "How will you connect?  (pgAdmin users: option 5 sets up everything once)" \
-      "pgadmin" "rider" "psql" "raw" "set up all pgAdmin servers (one-time import file)")
+    pick=$(prompt_choice "How will you connect?  (pgAdmin users: option 3 sets up everything once)" \
+      "manual connect (token)" "psql (launch now)" "set up all pgAdmin servers (one-time import file)")
     case "$pick" in
-      "set up all pgAdmin servers"*) client="export" ;;
-      *) client="$pick" ;;
+      "manual connect"*) client="token" ;;
+      "psql"*)           client="psql" ;;
+      "set up all"*)     client="export" ;;
     esac
   fi
 
@@ -360,10 +362,10 @@ main() {
 
   echo
   case "$client" in
-    pgadmin) handoff_clipboard "pgadmin" "$port" "$group" ;;
-    rider)   handoff_clipboard "rider" "$port" "$group" ;;
-    psql)    handoff_psql "$port" "$group" ;;
-    raw)     handoff_clipboard "raw" "$port" "$group" ;;
+    token)        handoff_token "$port" "$group" ;;
+    psql)         handoff_psql "$port" "$group" ;;
+    # accept the old client aliases (and -c flag values) for compatibility
+    pgadmin|rider|raw) handoff_token "$port" "$group" ;;
     *) log_error "Unknown client: $client"; exit 1 ;;
   esac
 }
@@ -412,19 +414,20 @@ handoff_psql() {
     psql "host=localhost port=${port} dbname=${DB_NAME} sslmode=require" || true
 }
 
-# --- pgAdmin / Rider / raw: connection details + token on the clipboard ----
-# Manual one-off connection. For pgAdmin auto-refresh (no token pasting), use
-# the "set up all pgAdmin servers" option instead.
-handoff_clipboard() {
-  local kind=$1 port=$2 group=$3
+# --- Manual connect: connection details + token on the clipboard -----------
+# Works for any client (pgAdmin, Rider, DBeaver, a psql GUI, ...): give the
+# connection details and the token to paste as the password. For pgAdmin
+# auto-refresh (no pasting), use the "set up all pgAdmin servers" option.
+handoff_token() {
+  local port=$1 group=$2
   local token; token="$("$PG_TOKEN_SCRIPT" 2>/dev/null || true)"
   [ -z "$token" ] && { log_error "Failed to get a token. Is your Azure session active? Run: az login"; exit 1; }
-  print_box "Connection details" "\
+  print_box "Connection details — paste the token as the password" "\
   Host      ${BOLD}localhost${NC}
   Port      ${BOLD}${port}${NC}
   Database  ${BOLD}${DB_NAME}${NC}
   Username  ${BOLD}${group}${NC}
-  Password  ${YELLOW}paste the token (copied to your clipboard)${NC}"
+  Password  ${YELLOW}the token (on your clipboard)${NC}"
   echo
   if command -v pbcopy >/dev/null 2>&1; then
     printf '%s' "$token" | pbcopy
@@ -432,15 +435,7 @@ handoff_clipboard() {
   else
     log_warning "pbcopy not found — copy the token manually (not shown here for safety)."
   fi
-  case "$kind" in
-    pgadmin)
-      log_info "pgAdmin: register a server with the details above; paste the token as the password."
-      log_info "For auto-refresh (no pasting), use the 'set up all pgAdmin servers' option instead."
-      ;;
-    rider)
-      log_info "Rider: add a PostgreSQL data source with the details above; paste the token as the password."
-      ;;
-  esac
+  log_info "pgAdmin tip: for auto-refresh (no token pasting), use the 'set up all pgAdmin servers' option."
 }
 
 main "$@"
