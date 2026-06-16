@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# =========================================================================
+# Dialogporten DB Login Helper
+#
+# Helps developers connect to a Dialogporten PostgreSQL database using
+# Microsoft Entra ID GROUP-based access across three tiers (read / write /
+# admin). You log in AS the group (group name = PG username) with a personal
+# Entra token; all activity is audit-logged and attributed to your individual
+# identity via the connection-auth log.
+#
+# This script does NOT create the SSH tunnel — run forward.sh first (it sets
+# up the JIT tunnel to localhost:<port>). This script then prepares the token
+# and tells you how to connect with your client of choice.
+#
+# Recommended client: pgAdmin with the auto-refreshing token (pg-token.sh as
+# "Password exec command") — set up once, then it self-serves. Rider / psql /
+# other are supported via a one-shot token copied to your clipboard.
+# =========================================================================
+set -uo pipefail
+
+export AZURE_CORE_COLLECT_TELEMETRY=false
+export AZURE_CORE_ONLY_SHOW_ERRORS=true
+
+# =========================================================================
+# Configuration  ── EDIT HERE when swapping to the real altinn-platform#3407
+#                   groups, or when port / path conventions change.
+# =========================================================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly PG_TOKEN_SCRIPT="${SCRIPT_DIR}/pg-token.sh"
+readonly DB_NAME="dialogporten"
+
+# Canonical env values (match forward.sh). yt01 = perf, lives in the test
+# subscription; low focus for now but included for completeness.
+readonly VALID_ENVIRONMENTS=("test" "yt01" "staging" "prod")
+readonly VALID_TIERS=("read" "write" "admin")
+
+# NOTE: stock macOS ships bash 3.2 (no associative arrays), and forward.sh is
+# bash-3.2 compatible, so we use case-based lookups instead of `declare -A`.
+
+# env -> friendly label (codename) for prompts.
+env_label() {
+  case "$1" in
+    test)    echo "test (AT23)" ;;
+    yt01)    echo "perf (YT01)" ;;
+    staging) echo "staging (TT02)" ;;
+    prod)    echo "prod" ;;
+    *)       echo "$1" ;;
+  esac
+}
+
+# env -> default local tunnel port (must match how you ran forward.sh).
+env_port() {
+  case "$1" in
+    test)    echo 25432 ;;
+    yt01)    echo 45432 ;;
+    staging) echo 35432 ;;
+    prod)    echo 15432 ;;
+    *)       echo "" ;;
+  esac
+}
+
+# env:tier -> Entra group name (the PG username you log in as).
+# staging currently REUSES the prod groups. This function is the SINGLE swap
+# point — replace the names here for the real altinn-platform#3407 groups.
+group_for() {
+  case "$1:$2" in
+    test:read)     echo "Altinn Product Dialogporten: Developers Dev" ;;
+    test:write)    echo "Dialogporten-Test-Operations" ;;
+    test:admin)    echo "Dialogporten-Test-UserAdmins" ;;
+    # yt01 (perf) shares the test subscription. Groups UNCONFIRMED — assumed to
+    # reuse the test groups; verify and correct before relying on yt01.
+    yt01:read)     echo "Altinn Product Dialogporten: Developers Dev" ;;
+    yt01:write)    echo "Dialogporten-Test-Operations" ;;
+    yt01:admin)    echo "Dialogporten-Test-UserAdmins" ;;
+    staging:read)  echo "Altinn Product Dialogporten: Developers Prod" ;;
+    staging:write) echo "Dialogporten-Prod-Operations" ;;
+    staging:admin) echo "Altinn Product Dialogporten: Admins Prod" ;;
+    prod:read)     echo "Altinn Product Dialogporten: Developers Prod" ;;
+    prod:write)    echo "Dialogporten-Prod-Operations" ;;
+    prod:admin)    echo "Altinn Product Dialogporten: Admins Prod" ;;
+    *)             echo "" ;;
+  esac
+}
+
+# =========================================================================
+# Colors / logging (mirrors forward.sh)
+# =========================================================================
+BLUE='\033[0;34m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+log_info()    { echo -e "${BLUE}ℹ${NC} $1"; }
+log_success() { echo -e "${GREEN}✓${NC} $1"; }
+log_warning() { echo -e "${YELLOW}⚠${NC} $1"; }
+log_error()   { echo -e "${RED}✖${NC} $1" >&2; }
+log_title()   { echo -e "\n${BOLD}${CYAN}$1${NC}"; }
+
+# locate az
+AZ=""
+for cand in "${AZ_BIN:-}" /opt/homebrew/bin/az /usr/local/bin/az "$(command -v az 2>/dev/null || true)"; do
+  [ -n "$cand" ] && [ -x "$cand" ] && { AZ="$cand"; break; }
+done
+
+# =========================================================================
+# Prompt helper (numbered select with optional default)
+# =========================================================================
+prompt_index() {
+  # $1=label (display strings shown), rest=display options.
+  # Echoes the 1-based INDEX chosen (caller maps it to a canonical value).
+  # Adds a trailing blank line for breathing room.
+  local label=$1; shift
+  local options=("$@") i sel
+  trap 'echo -e "\nCancelled" >&2; exit 130' INT
+  echo -e "${BOLD}${label}${NC}" >&2
+  for i in "${!options[@]}"; do echo -e "  ${CYAN}$((i+1)))${NC} ${options[$i]}" >&2; done
+  while true; do
+    read -rp "Select (1-${#options[@]}): " sel
+    if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#options[@]}" ]; then
+      echo "" >&2          # breathing room after the block
+      echo "$sel"; return
+    fi
+    log_error "Invalid selection."
+  done
+}
+
+validate_in() { # $1=value $2..=valid set ; returns 0 if member
+  local v=$1; shift
+  for x in "$@"; do [ "$v" = "$x" ] && return 0; done
+  return 1
+}
+
+# =========================================================================
+# Help
+# =========================================================================
+print_help() {
+  cat <<EOF
+Dialogporten DB Login Helper
+
+Prepares a Microsoft Entra token + connection details for a Dialogporten
+PostgreSQL database, using group-based access tiers. Run forward.sh FIRST to
+establish the SSH tunnel.
+
+Usage: $0 [-e ENV] [-t TIER] [-c CLIENT]
+  -e, --env     ${VALID_ENVIRONMENTS[*]}
+  -t, --tier    ${VALID_TIERS[*]}   (read=SELECT, write=DML, admin=DDL)
+  -c, --client  pgadmin | rider | psql | raw   (default: prompt; pgadmin recommended)
+  -h, --help
+
+Interactive when flags are omitted. Mirrors forward.sh's env-first flow.
+EOF
+}
+
+# =========================================================================
+# Main
+# =========================================================================
+main() {
+  local environment="" tier="" client=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -e|--env)    environment="${2:-}"; shift 2 ;;
+      -t|--tier)   tier="${2:-}"; shift 2 ;;
+      -c|--client) client="${2:-}"; shift 2 ;;
+      -h|--help)   print_help; exit 0 ;;
+      *) log_error "Unknown option: $1"; print_help; exit 1 ;;
+    esac
+  done
+
+  log_title "Dialogporten DB Login Helper"
+
+  # --- dependencies & identity -------------------------------------------
+  [ -z "$AZ" ] && { log_error "Azure CLI (az) not found. Install it or set AZ_BIN."; exit 1; }
+  if ! "$AZ" account show >/dev/null 2>&1; then
+    log_error "No active Azure session. Run:  az login"
+    exit 1
+  fi
+  local me; me="$("$AZ" account show --query user.name -o tsv 2>/dev/null)"
+  log_info "Active Azure identity: ${BOLD}${me}${NC}  (token will be attributed to this user)"
+  echo
+
+  # --- environment (show friendly labels, return canonical value) ---------
+  if [ -z "$environment" ]; then
+    local env_labels=() e
+    for e in "${VALID_ENVIRONMENTS[@]}"; do env_labels+=("$(env_label "$e")"); done
+    local idx; idx=$(prompt_index "Select environment:" "${env_labels[@]}")
+    environment="${VALID_ENVIRONMENTS[$((idx-1))]}"
+  fi
+  validate_in "$environment" "${VALID_ENVIRONMENTS[@]}" || { log_error "Invalid env: $environment"; exit 1; }
+
+  # --- tier ---------------------------------------------------------------
+  if [ -z "$tier" ]; then
+    local idx; idx=$(prompt_index "Select access tier:" "${VALID_TIERS[@]}")
+    tier="${VALID_TIERS[$((idx-1))]}"
+  fi
+  validate_in "$tier" "${VALID_TIERS[@]}" || { log_error "Invalid tier: $tier"; exit 1; }
+
+  local group port
+  group="$(group_for "$environment" "$tier")"
+  port="$(env_port "$environment")"; [ -z "$port" ] && port=5432
+  [ -z "$group" ] && { log_error "No group configured for ${environment}:${tier}"; exit 1; }
+
+  # --- prod guard ---------------------------------------------------------
+  if [ "$environment" = "prod" ]; then
+    log_warning "You are targeting ${BOLD}PROD${NC}."
+    read -rp "Type 'prod' to continue: " c; [ "$c" = "prod" ] || { log_warning "Aborted."; exit 0; }
+  fi
+
+  # --- best-effort membership pre-check (terminal CAN show this) ----------
+  local my_oid; my_oid="$("$AZ" ad signed-in-user show --query id -o tsv 2>/dev/null || true)"
+  if [ -n "$my_oid" ]; then
+    local is_member
+    is_member="$("$AZ" ad group member check --group "$group" --member-id "$my_oid" --query value -o tsv 2>/dev/null || true)"
+    if [ "$is_member" = "false" ]; then
+      log_error "Identity '${me}' is NOT a member of group '${group}'."
+      log_info  "You are likely on the wrong Azure account for ${environment}. Switch with: az login"
+      exit 1
+    elif [ "$is_member" = "true" ]; then
+      log_success "Membership confirmed: ${me} ∈ ${group}"
+    else
+      log_warning "Could not verify group membership (continuing; PostgreSQL will enforce it)."
+    fi
+  fi
+
+  # --- client selection ---------------------------------------------------
+  if [ -z "$client" ]; then
+    local clients=("pgadmin" "rider" "psql" "raw") idx
+    idx=$(prompt_index "How will you connect? (pgadmin recommended)" "${clients[@]}")
+    client="${clients[$((idx-1))]}"
+  fi
+
+  log_title "Connection — ${environment} / ${tier}"
+  echo -e "  Host:     ${BOLD}localhost${NC}"
+  echo -e "  Port:     ${BOLD}${port}${NC}   (from forward.sh)"
+  echo -e "  Database: ${BOLD}${DB_NAME}${NC}"
+  echo -e "  Username: ${BOLD}${group}${NC}"
+  echo
+
+  case "$client" in
+    pgadmin) handoff_pgadmin "$port" "$group" "$environment" "$tier" ;;
+    rider)   handoff_clipboard "rider" "$port" "$group" ;;
+    psql)    handoff_psql "$port" "$group" ;;
+    raw)     handoff_clipboard "raw" "$port" "$group" ;;
+    *) log_error "Unknown client: $client"; exit 1 ;;
+  esac
+}
+
+# --- pgAdmin: setup-helper (the recommended path) --------------------------
+handoff_pgadmin() {
+  local port=$1 group=$2 environment=$3 tier=$4
+  local server_name="Dialogporten ${environment} ${tier}"
+  log_success "pgAdmin ${GREEN}(recommended)${NC} — set up a server ${BOLD}once${NC}; it then auto-refreshes the token."
+  echo
+  echo -e "  Register a new server in pgAdmin with these values:"
+  echo
+  echo -e "  ${CYAN}${BOLD}General tab${NC}"
+  echo -e "    Name:          ${BOLD}${server_name}${NC}"
+  echo -e "    Connect now?   ${YELLOW}Off — must be disabled to save the server with no password${NC}"
+  echo
+  echo -e "  ${CYAN}${BOLD}Connection tab${NC}"
+  echo -e "    Host:                  ${BOLD}localhost${NC}"
+  echo -e "    Port:                  ${BOLD}${port}${NC}"
+  echo -e "    Maintenance database:  ${BOLD}${DB_NAME}${NC}"
+  echo -e "    Username:              ${BOLD}${group}${NC}"
+  echo -e "    Password:              ${YELLOW}(leave blank)${NC}"
+  echo
+  echo -e "  ${CYAN}${BOLD}Advanced tab${NC}"
+  echo -e "    Password exec command:           ${BOLD}${PG_TOKEN_SCRIPT}${NC}"
+  echo -e "    Password exec expiration (sec):  ${BOLD}3600${NC}"
+  echo
+  echo -e "  After saving, connect — pgAdmin runs the token script and re-runs it"
+  echo -e "  before expiry, so you won't need to paste tokens again."
+}
+
+# --- psql: offer to launch directly ---------------------------------------
+handoff_psql() {
+  local port=$1 group=$2
+  local token; token="$("$PG_TOKEN_SCRIPT" 2>/dev/null || true)"
+  [ -z "$token" ] && { log_error "Failed to get token (az login?)."; exit 1; }
+  log_info "Launching psql (token valid ~75 min for this session)..."
+  PGPASSWORD="$token" PGUSER="$group" \
+    psql "host=localhost port=${port} dbname=${DB_NAME} sslmode=require" || true
+}
+
+# --- Rider / raw: copy token to clipboard, never echo it -------------------
+handoff_clipboard() {
+  local kind=$1 port=$2 group=$3
+  local token; token="$("$PG_TOKEN_SCRIPT" 2>/dev/null || true)"
+  [ -z "$token" ] && { log_error "Failed to get token (az login?)."; exit 1; }
+  if command -v pbcopy >/dev/null 2>&1; then
+    printf '%s' "$token" | pbcopy
+    log_success "Token copied to clipboard (not shown). Valid ~75 min."
+  else
+    log_warning "pbcopy not found; cannot copy to clipboard on this OS."
+  fi
+  if [ "$kind" = "rider" ]; then
+    cat <<EOF
+  In Rider's Database tool: add a PostgreSQL data source with the Host/Port/
+  Database/Username above, and PASTE the token as the password. Rider does not
+  auto-refresh — re-run this script for a fresh token when it expires.
+EOF
+  else
+    log_info "Use the token as the password with the connection details above."
+  fi
+}
+
+main "$@"
