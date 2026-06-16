@@ -124,6 +124,19 @@ to_upper() {
     echo "$1" | tr '[:lower:]' '[:upper:]'
 }
 
+# env -> human-friendly label (Azure codename in parens). Display only; the
+# canonical env value (test/yt01/staging/prod) is what the rest of the script
+# uses. Note: Dialogporten test = AT23 (some other teams use AT22).
+env_label() {
+    case "$1" in
+        test)    echo "test (at23)"    ;;
+        yt01)    echo "perf (yt01)"    ;;
+        staging) echo "staging (tt02)" ;;
+        prod)    echo "prod"           ;;
+        *)       echo "$1"             ;;
+    esac
+}
+
 # Show an interactive selection prompt
 prompt_selection() {
     local prompt=$1
@@ -636,10 +649,18 @@ main() {
 
     check_dependencies
 
-    # If environment is not provided, prompt for it
+    # If environment is not provided, prompt for it (show friendly labels,
+    # return the canonical env value).
     if [ -z "$environment" ]; then
         log_info "Please select target environment:"
-        environment=$(prompt_selection "Environment (1-${#VALID_ENVIRONMENTS[@]}): " "${VALID_ENVIRONMENTS[@]}")
+        local env_labels=() ev chosen_label
+        for ev in "${VALID_ENVIRONMENTS[@]}"; do env_labels+=("$(env_label "$ev")"); done
+        chosen_label=$(prompt_selection "Environment (1-${#VALID_ENVIRONMENTS[@]}): " "${env_labels[@]}")
+        # map the chosen label back to its canonical env value by index
+        local i
+        for i in "${!env_labels[@]}"; do
+            [ "${env_labels[$i]}" = "$chosen_label" ] && { environment="${VALID_ENVIRONMENTS[$i]}"; break; }
+        done
     fi
     validate_environment "$environment"
 
@@ -655,8 +676,8 @@ main() {
         # postgres uses a per-env local port (avoids multi-env collisions); redis keeps its default
         default_port=$([[ "$db_type" == "postgres" ]] && postgres_local_port "$environment" || echo "$DEFAULT_REDIS_PORT")
         while true; do
-            log_info "Select the local port to bind on localhost (127.0.0.1)"
-            read -rp "Port to bind on localhost (default: $default_port): " local_port
+            log_info "Local port to bind on localhost (127.0.0.1) for ${BOLD}$(env_label "$environment")${NC} ${db_type}"
+            read -rp "Port [press Enter for default ${default_port}]: " local_port
             local_port=${local_port:-$default_port}
 
             if validate_port "$local_port"; then
@@ -680,7 +701,7 @@ main() {
 
     # Print confirmation
     print_box "Configuration" "\
-Environment: ${BOLD}${CYAN}${environment}${NC}
+Environment: ${BOLD}${CYAN}$(env_label "$environment")${NC}
 Database:    ${BOLD}${YELLOW}${db_type}${NC}
 Name:        ${BOLD}${name_override}${NC}
 Local Port:  ${BOLD}${local_port:-"<default>"}${NC}"

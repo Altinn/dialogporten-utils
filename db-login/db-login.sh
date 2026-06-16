@@ -37,6 +37,19 @@ readonly VALID_TIERS=("read" "write" "admin")
 # NOTE: stock macOS ships bash 3.2 (no associative arrays), and forward.sh is
 # bash-3.2 compatible, so we use case-based lookups instead of `declare -A`.
 
+# env -> human-friendly label (Azure codename in parens). Display only; the
+# canonical value (test/yt01/staging/prod) is what the script uses. Note:
+# Dialogporten test = AT23 (some other teams use AT22). Keep in sync w/ forward.sh.
+env_label() {
+  case "$1" in
+    test)    echo "test (at23)" ;;
+    yt01)    echo "perf (yt01)" ;;
+    staging) echo "staging (tt02)" ;;
+    prod)    echo "prod" ;;
+    *)       echo "$1" ;;
+  esac
+}
+
 # env -> default local tunnel port (must match how you ran forward.sh).
 # Scheme: increasing toward prod (prod on the highest, most-distinct port).
 env_port() {
@@ -84,18 +97,12 @@ group_for() {
 #   "$PYBIN" "$SETUP" load-servers servers.json --sqlite-path ~/.pgadmin/pgadmin4.db
 #   (add --replace to overwrite same-named servers; default --no-replace is additive)
 
-# Title Case a single lowercase word (bash 3.2 safe; no ${var^}).
-title_case() {
-  local w=$1
-  printf '%s%s' "$(printf '%s' "${w:0:1}" | tr '[:lower:]' '[:upper:]')" "${w:1}"
-}
-
 export_pgadmin() {
   local include_admin=$1     # "yes"/"no"
   local exec_cmd="$PG_TOKEN_SCRIPT"
   # tier -> privilege ordinal (read<write<admin) so servers sort least->most.
   local tiers=("read" "write" "admin")
-  local n=0 first=1 e t group port ord envtc tiertc
+  local n=0 first=1 e t group port ord
 
   printf '{\n  "Servers": {\n'
   for e in "${VALID_ENVIRONMENTS[@]}"; do
@@ -104,14 +111,13 @@ export_pgadmin() {
       group="$(group_for "$e" "$t")"; [ -z "$group" ] && continue
       port="$(env_port "$e")"; [ -z "$port" ] && continue
       case "$t" in read) ord=1 ;; write) ord=2 ;; admin) ord=3 ;; esac
-      # yt01 is an env codename, not a word — display it uppercased.
-      if [ "$e" = "yt01" ]; then envtc="YT01"; else envtc="$(title_case "$e")"; fi
-      tiertc="$(title_case "$t")"
       n=$((n+1))
       [ "$first" -eq 1 ] && first=0 || printf ',\n'
+      # Identifiers lowercase (Digdir convention) except the sort ordinal;
+      # env codename shown in the group label only.
       printf '    "%s": {\n' "$n"
-      printf '      "Name": "%s %s %s",\n' "$ord" "$envtc" "$tiertc"
-      printf '      "Group": "Dialogporten %s",\n' "$envtc"
+      printf '      "Name": "%s %s %s",\n' "$ord" "$e" "$t"
+      printf '      "Group": "Dialogporten %s",\n' "$(env_label "$e")"
       printf '      "Host": "localhost",\n'
       printf '      "Port": %s,\n' "$port"
       printf '      "MaintenanceDB": "%s",\n' "$DB_NAME"
@@ -254,9 +260,15 @@ main() {
   log_info "Active Azure identity: ${BOLD}${me}${NC}  (token will be attributed to this user)"
   echo
 
-  # --- environment --------------------------------------------------------
+  # --- environment (show friendly labels, return canonical value) ---------
   if [ -z "$environment" ]; then
-    environment=$(prompt_choice "Select environment:" "${VALID_ENVIRONMENTS[@]}")
+    local env_labels=() ev chosen
+    for ev in "${VALID_ENVIRONMENTS[@]}"; do env_labels+=("$(env_label "$ev")"); done
+    chosen=$(prompt_choice "Select environment:" "${env_labels[@]}")
+    local i
+    for i in "${!env_labels[@]}"; do
+      [ "${env_labels[$i]}" = "$chosen" ] && { environment="${VALID_ENVIRONMENTS[$i]}"; break; }
+    done
   fi
   validate_in "$environment" "${VALID_ENVIRONMENTS[@]}" || { log_error "Invalid env: $environment"; exit 1; }
 
@@ -284,7 +296,7 @@ main() {
     is_member="$("$AZ" ad group member check --group "$group" --member-id "$my_oid" --query value -o tsv 2>/dev/null || true)"
     if [ "$is_member" = "false" ]; then
       log_error "Identity '${me}' is NOT a member of group '${group}'."
-      log_info  "You are likely on the wrong Azure account for ${environment}. Switch with: az login"
+      log_info  "You are likely on the wrong Azure account for $(env_label "$environment"). Switch with: az login"
       exit 1
     elif [ "$is_member" = "true" ]; then
       log_success "Membership confirmed: ${me} ∈ ${group}"
