@@ -398,6 +398,8 @@ SETUP=\"/Applications/pgAdmin 4.app/Contents/Resources/web/setup.py\"
   fi
   echo
   echo "$import_cmd"
+  echo
+  log_info "After running it, ${BOLD}restart pgAdmin${NC} — the server tree only shows imported servers after a restart."
 }
 
 # --- psql: launch directly ------------------------------------------------
