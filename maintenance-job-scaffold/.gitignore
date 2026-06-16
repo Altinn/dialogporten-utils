@@ -1,0 +1,2 @@
+# Batch-log exports produced during a run -- audit artifacts, not source.
+*.csv
