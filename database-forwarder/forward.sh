@@ -22,9 +22,22 @@ export AZURE_CORE_DISABLE_UPGRADE_WARNINGS=yes
 # Constants
 # =========================================================================
 readonly PRODUCT_TAG="Dialogporten"
-readonly DEFAULT_POSTGRES_PORT=5432
+readonly DEFAULT_POSTGRES_PORT=5432   # remote port on the server (do not change)
 readonly DEFAULT_REDIS_PORT=6380
 readonly VALID_ENVIRONMENTS=("test" "yt01" "staging" "prod")
+
+# Per-env LOCAL bind port for postgres, so tunnels to multiple envs don't
+# collide on localhost. Scheme: increasing toward prod (prod most distinct).
+# Keep in sync with db-login.sh env_port() and the pgAdmin server configs.
+postgres_local_port() {
+    case "$1" in
+        test)    echo 15432 ;;
+        yt01)    echo 25432 ;;
+        staging) echo 35432 ;;
+        prod)    echo 45432 ;;
+        *)       echo "$DEFAULT_POSTGRES_PORT" ;;
+    esac
+}
 readonly VALID_DB_TYPES=("postgres" "redis")
 readonly SUBSCRIPTION_PREFIX="Dialogporten"
 readonly JIT_DURATION="PT1H"  # 1 hour duration for JIT access
@@ -207,7 +220,8 @@ Options:
                           - prod      -> ${SUBSCRIPTION_PREFIX}-Prod
 
     -t, --type TYPE       Database type to connect to (${VALID_DB_TYPES[*]})
-                          - postgres: PostgreSQL Flexible Server (default port: $DEFAULT_POSTGRES_PORT)
+                          - postgres: PostgreSQL Flexible Server (local port per env:
+                            test=15432, yt01=25432, staging=35432, prod=45432)
                           - redis:    Redis Cache (default port: $DEFAULT_REDIS_PORT)
 
     -n, --name NAME       Override resource base name for selected type/environment
@@ -638,7 +652,8 @@ main() {
 
     # If local_port is not provided, prompt for it
     if [ -z "$local_port" ]; then
-        default_port=$([[ "$db_type" == "postgres" ]] && echo "$DEFAULT_POSTGRES_PORT" || echo "$DEFAULT_REDIS_PORT")
+        # postgres uses a per-env local port (avoids multi-env collisions); redis keeps its default
+        default_port=$([[ "$db_type" == "postgres" ]] && postgres_local_port "$environment" || echo "$DEFAULT_REDIS_PORT")
         while true; do
             log_info "Select the local port to bind on localhost (127.0.0.1)"
             read -rp "Port to bind on localhost (default: $default_port): " local_port

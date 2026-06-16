@@ -38,12 +38,13 @@ readonly VALID_TIERS=("read" "write" "admin")
 # bash-3.2 compatible, so we use case-based lookups instead of `declare -A`.
 
 # env -> default local tunnel port (must match how you ran forward.sh).
+# Scheme: increasing toward prod (prod on the highest, most-distinct port).
 env_port() {
   case "$1" in
-    test)    echo 25432 ;;
-    yt01)    echo 45432 ;;
+    test)    echo 15432 ;;
+    yt01)    echo 25432 ;;
     staging) echo 35432 ;;
-    prod)    echo 15432 ;;
+    prod)    echo 45432 ;;
     *)       echo "" ;;
   esac
 }
@@ -56,8 +57,8 @@ group_for() {
     test:read)     echo "Altinn Product Dialogporten: Developers Dev" ;;
     test:write)    echo "Dialogporten-Test-Operations" ;;
     test:admin)    echo "Dialogporten-Test-UserAdmins" ;;
-    # yt01 (perf) shares the test subscription. Groups UNCONFIRMED — assumed to
-    # reuse the test groups; verify and correct before relying on yt01.
+    # yt01 (perf) shares the test subscription and reuses the TEST groups,
+    # both now and after #3407 lands.
     yt01:read)     echo "Altinn Product Dialogporten: Developers Dev" ;;
     yt01:write)    echo "Dialogporten-Test-Operations" ;;
     yt01:admin)    echo "Dialogporten-Test-UserAdmins" ;;
@@ -69,6 +70,59 @@ group_for() {
     prod:admin)    echo "Altinn Product Dialogporten: Admins Prod" ;;
     *)             echo "" ;;
   esac
+}
+
+# =========================================================================
+# pgAdmin servers.json generator (--export-pgadmin)
+# =========================================================================
+# Emits a pgAdmin Import/Export "Servers" JSON to stdout, with one server per
+# env:tier in per-env groups, the token exec command wired to this machine's
+# pg-token.sh, and no stored passwords (token comes from the exec command).
+#
+# Import (CLI, works around the GUI dialog bug pgadmin#9972), additive by default:
+#   PYBIN=".../python3.13"; SETUP=".../web/setup.py"
+#   "$PYBIN" "$SETUP" load-servers servers.json --sqlite-path ~/.pgadmin/pgadmin4.db
+#   (add --replace to overwrite same-named servers; default --no-replace is additive)
+
+# Title Case a single lowercase word (bash 3.2 safe; no ${var^}).
+title_case() {
+  local w=$1
+  printf '%s%s' "$(printf '%s' "${w:0:1}" | tr '[:lower:]' '[:upper:]')" "${w:1}"
+}
+
+export_pgadmin() {
+  local include_admin=$1     # "yes"/"no"
+  local exec_cmd="$PG_TOKEN_SCRIPT"
+  # tier -> privilege ordinal (read<write<admin) so servers sort least->most.
+  local tiers=("read" "write" "admin")
+  local n=0 first=1 e t group port ord envtc tiertc
+
+  printf '{\n  "Servers": {\n'
+  for e in "${VALID_ENVIRONMENTS[@]}"; do
+    for t in "${tiers[@]}"; do
+      [ "$t" = "admin" ] && [ "$include_admin" = "no" ] && continue
+      group="$(group_for "$e" "$t")"; [ -z "$group" ] && continue
+      port="$(env_port "$e")"; [ -z "$port" ] && continue
+      case "$t" in read) ord=1 ;; write) ord=2 ;; admin) ord=3 ;; esac
+      # yt01 is an env codename, not a word — display it uppercased.
+      if [ "$e" = "yt01" ]; then envtc="YT01"; else envtc="$(title_case "$e")"; fi
+      tiertc="$(title_case "$t")"
+      n=$((n+1))
+      [ "$first" -eq 1 ] && first=0 || printf ',\n'
+      printf '    "%s": {\n' "$n"
+      printf '      "Name": "%s %s %s",\n' "$ord" "$envtc" "$tiertc"
+      printf '      "Group": "Dialogporten %s",\n' "$envtc"
+      printf '      "Host": "localhost",\n'
+      printf '      "Port": %s,\n' "$port"
+      printf '      "MaintenanceDB": "%s",\n' "$DB_NAME"
+      printf '      "Username": "%s",\n' "$group"
+      printf '      "ConnectionParameters": { "sslmode": "require", "connect_timeout": 10 },\n'
+      printf '      "PasswordExecCommand": "%s",\n' "$exec_cmd"
+      printf '      "PasswordExecExpiration": 3600\n'
+      printf '    }'
+    done
+  done
+  printf '\n  }\n}\n'
 }
 
 # =========================================================================
@@ -146,12 +200,22 @@ PostgreSQL database, using group-based access tiers. Run forward.sh FIRST to
 establish the SSH tunnel.
 
 Usage: $0 [-e ENV] [-t TIER] [-c CLIENT]
-  -e, --env     ${VALID_ENVIRONMENTS[*]}
-  -t, --tier    ${VALID_TIERS[*]}   (read=SELECT, write=DML, admin=DDL)
-  -c, --client  pgadmin | rider | psql | raw   (default: prompt; pgadmin recommended)
+       $0 --export-pgadmin [--no-admin] > servers.json
+
+  -e, --env         ${VALID_ENVIRONMENTS[*]}
+  -t, --tier        ${VALID_TIERS[*]}   (read=SELECT, write=DML, admin=DDL)
+  -c, --client      pgadmin | rider | psql | raw   (default: prompt; pgadmin recommended)
+  --export-pgadmin  Emit a pgAdmin Import/Export servers JSON to stdout (all envs/tiers,
+                    per-env groups, token exec command wired to this machine). No prompts.
+  --no-admin        With --export-pgadmin: omit the admin/DDL tier servers.
   -h, --help
 
 Interactive when flags are omitted. Mirrors forward.sh's env-first flow.
+
+Import the generated file (CLI; additive by default), e.g.:
+  PYBIN="/Applications/pgAdmin 4.app/Contents/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
+  SETUP="/Applications/pgAdmin 4.app/Contents/Resources/web/setup.py"
+  "\$PYBIN" "\$SETUP" load-servers servers.json --sqlite-path ~/.pgadmin/pgadmin4.db
 EOF
 }
 
@@ -159,16 +223,24 @@ EOF
 # Main
 # =========================================================================
 main() {
-  local environment="" tier="" client=""
+  local environment="" tier="" client="" export_mode="" include_admin="yes"
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -e|--env)    environment="${2:-}"; shift 2 ;;
-      -t|--tier)   tier="${2:-}"; shift 2 ;;
-      -c|--client) client="${2:-}"; shift 2 ;;
-      -h|--help)   print_help; exit 0 ;;
+      -e|--env)         environment="${2:-}"; shift 2 ;;
+      -t|--tier)        tier="${2:-}"; shift 2 ;;
+      -c|--client)      client="${2:-}"; shift 2 ;;
+      --export-pgadmin) export_mode="yes"; shift ;;
+      --no-admin)       include_admin="no"; shift ;;
+      -h|--help)        print_help; exit 0 ;;
       *) log_error "Unknown option: $1"; print_help; exit 1 ;;
     esac
   done
+
+  # Generator mode: emit servers.json to stdout and exit (no prompts, no az needed).
+  if [ "$export_mode" = "yes" ]; then
+    export_pgadmin "$include_admin"
+    exit 0
+  fi
 
   log_title "Dialogporten DB Login Helper"
 
