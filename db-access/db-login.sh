@@ -412,20 +412,20 @@ main() {
     is_member="$("$AZ" ad group member check --group "$group" --member-id "$my_oid" --query value -o tsv 2>/dev/null || true)"
     if [ "$is_member" = "false" ]; then
       log_error "Identity '${me}' is NOT currently in group '${group}'."
-      # The check can't tell "wrong account" from "not PIM-activated", so lead
-      # with the likeliest cause per tier. read = standing membership (no PIM);
-      # write/admin = PIM-activated on demand.
+      # A bare 'false' has several causes the check can't distinguish; list the
+      # realistic ones per tier. read = standing membership (no PIM);
+      # write/admin = PIM-eligible, activated on demand.
       if [ "$tier" = "read" ]; then
-        log_info  "Read access is standing membership, so this is most likely the wrong Azure account."
-        log_info  "If you're already logged in as the right one:"
-        echo      "    az account list -o table                  # find a subscription under the right account"
-        echo      "    az account set --subscription \"<name>\"     # switches the active account"
-        log_info  "Otherwise sign in:  az login"
+        log_info  "Read access is standing membership. Likely causes:"
+        log_info  "  • You haven't been granted read access yet → ask to be added to the group."
+        log_info  "  • The account auto-switch couldn't reach the right account for this env:"
+        echo      "      az account list -o table   /   az account set --subscription \"<name>\"   /   az login"
       else
-        log_info  "${BOLD}${tier}${NC} access is granted on demand via PIM — most likely you haven't activated"
-        log_info  "it yet (or your activation expired). ${PIM_ACTIVATION_HINT}"
-        log_info  "If you have already activated and are still rejected, check you're on the right account:"
-        echo      "    az account list -o table   /   az account set --subscription \"<name>\"   /   az login"
+        log_info  "${BOLD}${tier}${NC} access is granted on demand via PIM. Likely causes:"
+        log_info  "  • You're eligible but haven't activated yet (or it expired) → ${PIM_ACTIVATION_HINT}"
+        log_info  "  • You may not be eligible for this role at all → request ${tier} access if you need it."
+        log_info  "  • Already activated and on the right account? Then re-check the account:"
+        echo      "      az account list -o table   /   az account set --subscription \"<name>\"   /   az login"
       fi
       exit 1
     elif [ "$is_member" = "true" ]; then
