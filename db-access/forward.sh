@@ -782,10 +782,14 @@ Remote Port: ${port}
 Connection String:
 ${BOLD}${connection_string/localhost/$'\n'localhost}${NC}"
 
-    # For postgres, point the dev at the token helper (run locally, separate tab).
+    # For postgres, point the dev at the token helper (a sibling script, run
+    # locally in a separate terminal). Print the resolved absolute path.
     if [ "$db_type" = "postgres" ]; then
+        local login_script
+        login_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/db-login.sh"
         echo
-        log_info "Next: in a ${BOLD}new terminal${NC}, run ${BOLD}db-login.sh${NC} to get a DB token for pgAdmin/psql/Rider."
+        echo -e "${YELLOW}➜ Next: in a new terminal, run db-login.sh for a DB token (pgAdmin/psql/Rider):${NC}"
+        echo -e "    ${BOLD}${login_script}${NC}"
     fi
 
     # Set up the SSH tunnel

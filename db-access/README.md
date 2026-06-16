@@ -1,4 +1,19 @@
-# Database Connection Forwarding
+# Database Access (tunnel + Entra login)
+
+Two companion scripts for connecting to Dialogporten databases:
+
+- **`forward.sh`** — opens an SSH tunnel through the JIT jumper to a Postgres/Redis
+  server (`localhost:<per-env port>`).
+- **`db-login.sh`** — for Postgres, gets a Microsoft Entra access token for
+  group-based DB access and helps you connect (pgAdmin / psql / Rider), or
+  generates a pgAdmin servers-import file. Run it locally in a separate terminal
+  after `forward.sh` has the tunnel up. (`pg-token.sh` is the token helper it and
+  pgAdmin's auto-refresh use.)
+
+> NOTE: the sections below document `forward.sh` only and predate the Entra-token
+> access model (they still mention Key Vault passwords / old default ports). A
+> full rewrite covering both scripts is pending the documentation pass. Use
+> `./forward.sh --help` and `./db-login.sh --help` for current, accurate usage.
 
 This utility helps forward PostgreSQL and Redis connections through SSH for Dialogporten environments.
 
