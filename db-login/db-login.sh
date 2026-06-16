@@ -97,6 +97,32 @@ group_for() {
 #   "$PYBIN" "$SETUP" load-servers servers.json --sqlite-path ~/.pgadmin/pgadmin4.db
 #   (add --replace to overwrite same-named servers; default --no-replace is additive)
 
+# Title Case a single lowercase word (bash 3.2 safe; no ${var^}).
+title_case() {
+  local w=$1
+  printf '%s%s' "$(printf '%s' "${w:0:1}" | tr '[:lower:]' '[:upper:]')" "${w:1}"
+}
+
+# Display: friendly env WORD Title Cased, Azure codename kept lowercase in parens.
+# e.g. test -> "Test (at23)", yt01 -> "Perf (yt01)", prod -> "Prod".
+env_display() {
+  case "$1" in
+    test)    echo "Test (at23)" ;;
+    yt01)    echo "Perf (yt01)" ;;
+    staging) echo "Staging (tt02)" ;;
+    prod)    echo "Prod" ;;
+    *)       echo "$(title_case "$1")" ;;
+  esac
+}
+
+# Display env WORD only, Title Cased, no codename (for terse server names).
+env_word() {
+  case "$1" in
+    test) echo "Test" ;; yt01) echo "Perf" ;; staging) echo "Staging" ;; prod) echo "Prod" ;;
+    *) echo "$(title_case "$1")" ;;
+  esac
+}
+
 export_pgadmin() {
   local include_admin=$1     # "yes"/"no"
   local exec_cmd="$PG_TOKEN_SCRIPT"
@@ -113,11 +139,11 @@ export_pgadmin() {
       case "$t" in read) ord=1 ;; write) ord=2 ;; admin) ord=3 ;; esac
       n=$((n+1))
       [ "$first" -eq 1 ] && first=0 || printf ',\n'
-      # Identifiers lowercase (Digdir convention) except the sort ordinal;
-      # env codename shown in the group label only.
+      # Title Case the words (Test, Read), keep the env codename (at23) lowercase;
+      # ordinal prefix preserves read->write->admin sort order.
       printf '    "%s": {\n' "$n"
-      printf '      "Name": "%s %s %s",\n' "$ord" "$e" "$t"
-      printf '      "Group": "Dialogporten %s",\n' "$(env_label "$e")"
+      printf '      "Name": "%s %s %s",\n' "$ord" "$(env_word "$e")" "$(title_case "$t")"
+      printf '      "Group": "Dialogporten %s",\n' "$(env_display "$e")"
       printf '      "Host": "localhost",\n'
       printf '      "Port": %s,\n' "$port"
       printf '      "MaintenanceDB": "%s",\n' "$DB_NAME"
@@ -260,6 +286,24 @@ main() {
   log_info "Active Azure identity: ${BOLD}${me}${NC}  (token will be attributed to this user)"
   echo
 
+  # --- client selection (first: option to set up all pgAdmin servers) -----
+  if [ -z "$client" ]; then
+    local pick
+    pick=$(prompt_choice "How will you connect? (pgadmin recommended)" \
+      "pgadmin" "rider" "psql" "raw" "set up all pgAdmin servers (one-time import file)")
+    case "$pick" in
+      "set up all pgAdmin servers"*) client="export" ;;
+      *) client="$pick" ;;
+    esac
+  fi
+
+  # Generator path: write the servers.json file + import instructions, then done.
+  # Doesn't need env/tier/membership — it produces all envs and tiers.
+  if [ "$client" = "export" ]; then
+    interactive_export_pgadmin "$include_admin"
+    exit 0
+  fi
+
   # --- environment (show friendly labels, return canonical value) ---------
   if [ -z "$environment" ]; then
     local env_labels=() ev chosen
@@ -306,11 +350,6 @@ main() {
     echo
   fi
 
-  # --- client selection ---------------------------------------------------
-  if [ -z "$client" ]; then
-    client=$(prompt_choice "How will you connect? (pgadmin recommended)" "pgadmin" "rider" "psql" "raw")
-  fi
-
   echo
   case "$client" in
     pgadmin) handoff_pgadmin "$port" "$group" "$environment" "$tier" ;;
@@ -319,6 +358,24 @@ main() {
     raw)     handoff_clipboard "raw" "$port" "$group" ;;
     *) log_error "Unknown client: $client"; exit 1 ;;
   esac
+}
+
+# --- Interactive generator: write servers.json to a file + import command --
+interactive_export_pgadmin() {
+  local include_admin=$1
+  local out="./dp-pgadmin-servers.json"
+  export_pgadmin "$include_admin" > "$out"
+  local count; count=$(grep -c '"Name"' "$out")
+  log_success "Wrote ${count} pgAdmin servers to ${BOLD}${out}${NC}"
+  echo
+  log_info "Import them (additive; safe to keep your existing servers):"
+  cat <<EOF
+  PYBIN="/Applications/pgAdmin 4.app/Contents/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
+  SETUP="/Applications/pgAdmin 4.app/Contents/Resources/web/setup.py"
+  "\$PYBIN" "\$SETUP" load-servers "$(cd "$(dirname "$out")" && pwd)/$(basename "$out")" --sqlite-path ~/.pgadmin/pgadmin4.db
+EOF
+  echo
+  log_info "Add ${BOLD}--replace${NC} to the load-servers command to update servers you imported before."
 }
 
 # --- pgAdmin: setup-helper (the recommended path) --------------------------
