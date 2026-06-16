@@ -130,6 +130,7 @@ export_pgadmin() {
   local tiers=("read" "write" "admin")
   local n=0 first=1 e t group port ord
 
+  local genv
   printf '{\n  "Servers": {\n'
   for e in "${VALID_ENVIRONMENTS[@]}"; do
     for t in "${tiers[@]}"; do
@@ -137,13 +138,15 @@ export_pgadmin() {
       group="$(group_for "$e" "$t")"; [ -z "$group" ] && continue
       port="$(env_port "$e")"; [ -z "$port" ] && continue
       case "$t" in read) ord=1 ;; write) ord=2 ;; admin) ord=3 ;; esac
+      # env ordinal (test<yt01<staging<prod) so groups sort test->prod, not alphabetically.
+      case "$e" in test) genv=1 ;; yt01) genv=2 ;; staging) genv=3 ;; prod) genv=4 ;; *) genv=9 ;; esac
       n=$((n+1))
       [ "$first" -eq 1 ] && first=0 || printf ',\n'
       # Title Case the words (Test, Read), keep the env codename (at23) lowercase;
-      # ordinal prefix preserves read->write->admin sort order.
+      # ordinal prefixes preserve env (group) and tier (server) sort order.
       printf '    "%s": {\n' "$n"
       printf '      "Name": "%s %s %s",\n' "$ord" "$(env_word "$e")" "$(title_case "$t")"
-      printf '      "Group": "Dialogporten %s",\n' "$(env_display "$e")"
+      printf '      "Group": "%s Dialogporten %s",\n' "$genv" "$(env_display "$e")"
       printf '      "Host": "localhost",\n'
       printf '      "Port": %s,\n' "$port"
       printf '      "MaintenanceDB": "%s",\n' "$DB_NAME"
@@ -365,22 +368,36 @@ main() {
   esac
 }
 
-# --- Interactive generator: write servers.json to a file + import command --
+# --- Interactive generator: write servers.json + ready-to-run import command -
 interactive_export_pgadmin() {
   local include_admin=$1
   local out="./dp-pgadmin-servers.json"
   export_pgadmin "$include_admin" > "$out"
+  local abs_out; abs_out="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
   local count; count=$(grep -c '"Name"' "$out")
-  log_success "Wrote ${count} pgAdmin servers to ${BOLD}${out}${NC}"
+  log_success "Wrote ${count} pgAdmin servers to ${BOLD}${abs_out}${NC}"
   echo
-  log_info "Import them (additive; safe to keep your existing servers):"
-  cat <<EOF
-  PYBIN="/Applications/pgAdmin 4.app/Contents/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
-  SETUP="/Applications/pgAdmin 4.app/Contents/Resources/web/setup.py"
-  "\$PYBIN" "\$SETUP" load-servers "$(cd "$(dirname "$out")" && pwd)/$(basename "$out")" --sqlite-path ~/.pgadmin/pgadmin4.db
-EOF
+
+  # Build the import command (multi-line; pasting runs all three lines).
+  local import_cmd
+  import_cmd="PYBIN=\"/Applications/pgAdmin 4.app/Contents/Frameworks/Python.framework/Versions/3.13/bin/python3.13\"
+SETUP=\"/Applications/pgAdmin 4.app/Contents/Resources/web/setup.py\"
+\"\$PYBIN\" \"\$SETUP\" load-servers \"${abs_out}\" --sqlite-path ~/.pgadmin/pgadmin4.db"
+
+  log_warning "Requires pgAdmin 4 to be installed (the import uses its bundled tooling)."
+  if command -v pbcopy >/dev/null 2>&1; then
+    printf '%s' "$import_cmd" | pbcopy
+    print_box "Import command — ${GREEN}copied to your clipboard${NC}" "\
+  Paste it into a terminal and run it.
+  ${YELLOW}Additive${NC} by default (keeps your existing servers); add ${BOLD}--replace${NC}
+  to update servers you imported before."
+  else
+    print_box "Import command" "\
+  Run the command below in a terminal (pbcopy unavailable, not auto-copied).
+  ${YELLOW}Additive${NC} by default; add ${BOLD}--replace${NC} to update prior imports."
+  fi
   echo
-  log_info "Add ${BOLD}--replace${NC} to the load-servers command to update servers you imported before."
+  echo "$import_cmd"
 }
 
 # --- psql: launch directly ------------------------------------------------
