@@ -295,16 +295,24 @@ main() {
 
   # --- dependencies & identity -------------------------------------------
   [ -z "$AZ" ] && { log_error "Azure CLI (az) not found. Install it or set AZ_BIN."; exit 1; }
-  if ! "$AZ" account show >/dev/null 2>&1; then
-    log_error "No active Azure session. Run:  az login"
-    exit 1
-  fi
-  local me; me="$("$AZ" account show --query user.name -o tsv 2>/dev/null)"
-  log_info "Active Azure identity: ${BOLD}${me}${NC}  (token will be attributed to this user)"
 
   # Cache the enabled-subscription list once (used for the landscape + auto-switch).
   # Format per line: "<user>\t<subscription>\t<isDefault>"
   AZ_ACCOUNTS="$("$AZ" account list --query "[?state=='Enabled'].[user.name, name, isDefault]" -o tsv 2>/dev/null || true)"
+
+  # Gate on having ANY logged-in account, not on having an ACTIVE one — you can
+  # be logged into account A while B (which was active) is logged out, leaving no
+  # active account but a usable session. The per-env auto-switch picks the right one.
+  if [ -z "$AZ_ACCOUNTS" ]; then
+    log_error "No Azure accounts logged in. Run:  az login"
+    exit 1
+  fi
+  local me; me="$("$AZ" account show --query user.name -o tsv 2>/dev/null || true)"
+  if [ -n "$me" ]; then
+    log_info "Active Azure identity: ${BOLD}${me}${NC}  (token will be attributed to this user)"
+  else
+    log_warning "No ${BOLD}active${NC} Azure account (one was logged out) — pick an env and it will switch to the right one."
+  fi
 
   # Show which identities are logged in and which Dialogporten subs each holds.
   local dp_accounts
