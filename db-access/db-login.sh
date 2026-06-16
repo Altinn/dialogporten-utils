@@ -50,6 +50,17 @@ env_label() {
   esac
 }
 
+# env -> the Azure subscription that env's DB lives in. Used to auto-switch the
+# active az account so the token gets the right identity. Keep in sync w/ forward.sh.
+env_subscription() {
+  case "$1" in
+    test|yt01) echo "Dialogporten-Test" ;;
+    staging)   echo "Dialogporten-Staging" ;;
+    prod)      echo "Dialogporten-Prod" ;;
+    *)         echo "" ;;
+  esac
+}
+
 # env -> default local tunnel port (must match how you ran forward.sh).
 # Scheme: increasing toward prod (prod on the highest, most-distinct port).
 env_port() {
@@ -290,6 +301,28 @@ main() {
   fi
   local me; me="$("$AZ" account show --query user.name -o tsv 2>/dev/null)"
   log_info "Active Azure identity: ${BOLD}${me}${NC}  (token will be attributed to this user)"
+
+  # Cache the enabled-subscription list once (used for the landscape + auto-switch).
+  # Format per line: "<user>\t<subscription>\t<isDefault>"
+  AZ_ACCOUNTS="$("$AZ" account list --query "[?state=='Enabled'].[user.name, name, isDefault]" -o tsv 2>/dev/null || true)"
+
+  # Show which identities are logged in and which Dialogporten subs each holds.
+  local dp_accounts
+  dp_accounts="$(printf '%s\n' "$AZ_ACCOUNTS" | grep -i 'Dialogporten-' || true)"
+  if [ -n "$dp_accounts" ]; then
+    log_info "Logged-in accounts (Dialogporten subscriptions):"
+    # group by user, mark the active one
+    printf '%s\n' "$dp_accounts" | awk -F'\t' '
+      { subs[$1] = subs[$1] (subs[$1]?", ":"") $2; if ($3=="True") active[$1]=1 }
+      END { for (u in subs) printf "%s\t%s\t%s\n", (u in active?"*":" "), u, subs[u] }
+    ' | while IFS=$'\t' read -r mark user subs; do
+      if [ "$mark" = "*" ]; then
+        echo -e "    ${GREEN}●${NC} ${BOLD}${user}${NC} → ${subs}  ${GREEN}(active)${NC}"
+      else
+        echo -e "      ${user} → ${subs}"
+      fi
+    done
+  fi
   echo
 
   # --- client selection (first: option to set up all pgAdmin servers) -----
@@ -322,6 +355,27 @@ main() {
     done
   fi
   validate_in "$environment" "${VALID_ENVIRONMENTS[@]}" || { log_error "Invalid env: $environment"; exit 1; }
+
+  # --- auto-switch active Azure account to the env's subscription ----------
+  # Each Dialogporten env lives in a known subscription owned by a specific
+  # identity; `az account set` flips the active account when that sub belongs to
+  # a different logged-in identity. Only switch if the target sub is available
+  # and not already active; otherwise leave it and let the membership check guide.
+  local target_sub active_sub
+  target_sub="$(env_subscription "$environment")"
+  active_sub="$("$AZ" account show --query name -o tsv 2>/dev/null || true)"
+  if [ -n "$target_sub" ] && [ "$target_sub" != "$active_sub" ]; then
+    if printf '%s\n' "$AZ_ACCOUNTS" | awk -F'\t' -v s="$target_sub" '$2==s{found=1} END{exit !found}'; then
+      if "$AZ" account set --subscription "$target_sub" >/dev/null 2>&1; then
+        me="$("$AZ" account show --query user.name -o tsv 2>/dev/null)"
+        log_success "Switched active Azure account to ${BOLD}${me}${NC} (subscription ${target_sub})"
+      else
+        log_warning "Could not switch to ${target_sub}; continuing with the current account."
+      fi
+    else
+      log_warning "${target_sub} isn't in your logged-in accounts — you may need: az login"
+    fi
+  fi
 
   # --- tier ---------------------------------------------------------------
   if [ -z "$tier" ]; then
