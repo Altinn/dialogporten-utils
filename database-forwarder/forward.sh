@@ -723,14 +723,27 @@ Environment: ${BOLD}${CYAN}$(env_label "$environment")${NC}
 Database:    ${BOLD}${YELLOW}${db_type}${NC}
 Name:        ${BOLD}${name_override}${NC}
 Local Port:  ${BOLD}${local_port:-"<default>"}${NC}"
+    echo
 
-    read -rp "Proceed? (y/N) " confirm
-    if [[ ! $confirm =~ ^[Yy]$ ]]; then
-        log_warning "Operation cancelled by user"
-        exit 0
+    # Confirm + pick tunnel mode in one step. (If --shell was passed explicitly,
+    # honor it and skip the prompt — intent is already stated.)
+    if [ "$shell_mode" != "true" ]; then
+        echo -e "${BOLD}How do you want to connect?${NC}"
+        echo -e "  ${CYAN}1)${NC} Tunnel only        (recommended — port-forward, Ctrl-C to stop)"
+        echo -e "  ${CYAN}2)${NC} Tunnel + shell     (also opens an interactive shell on the jumper)"
+        echo -e "  ${CYAN}3)${NC} Cancel"
+        local mode
+        read -rp "Select (1-3) [default: 1]: " mode
+        case "${mode:-1}" in
+            1) shell_mode="false" ;;
+            2) shell_mode="true" ;;
+            3) log_warning "Cancelled."; exit 0 ;;
+            *) log_warning "Cancelled (unrecognized choice)."; exit 0 ;;
+        esac
     fi
+    echo
 
-    log_info "Setting up connection for ${BOLD}${environment}${NC} environment"
+    log_info "Setting up connection for ${BOLD}$(env_label "$environment")${NC}"
 
     # Get database information based on database type
     local resource_info
