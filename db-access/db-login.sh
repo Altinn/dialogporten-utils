@@ -57,8 +57,9 @@ env_label() {
   esac
 }
 
-# env -> the Azure subscription that env's DB lives in. Used to auto-switch the
-# active az account so the token gets the right identity. Keep in sync w/ forward.sh.
+# env -> the Azure subscription that env's DB lives in. Used to fetch the token
+# scoped to the right identity (we never switch the active account). Keep in sync
+# w/ forward.sh.
 env_subscription() {
   case "$1" in
     test|yt01) echo "Dialogporten-Test" ;;
@@ -66,6 +67,15 @@ env_subscription() {
     prod)      echo "Dialogporten-Prod" ;;
     *)         echo "" ;;
   esac
+}
+
+# True if the subscription that owns $1 (an env) is among the logged-in accounts
+# (matches column 2 of the cached AZ_ACCOUNTS: "<user>\t<sub>\t<isDefault>").
+# Used to mark unreachable envs red in the prompt. AZ_ACCOUNTS is set in main().
+subscription_logged_in() {
+  local sub_name; sub_name="$(env_subscription "$1")"
+  [ -z "$sub_name" ] && return 1
+  printf '%s\n' "${AZ_ACCOUNTS:-}" | awk -F'\t' -v s="$sub_name" '$2==s{f=1} END{exit !f}'
 }
 
 # env -> default local tunnel port (must match how you ran forward.sh).
@@ -149,7 +159,6 @@ env_word() {
 
 export_pgadmin() {
   local include_migrator=$1     # "yes"/"no"
-  local exec_cmd="$PG_TOKEN_SCRIPT"
   # tier -> privilege ordinal (read<write<migrator) so servers sort least->most.
   local tiers=("read" "write" "migrator")
   local n=0 first=1 e t group port ord
@@ -176,7 +185,10 @@ export_pgadmin() {
       printf '      "MaintenanceDB": "%s",\n' "$DB_NAME"
       printf '      "Username": "%s",\n' "$group"
       printf '      "ConnectionParameters": { "sslmode": "require", "connect_timeout": 10 },\n'
-      printf '      "PasswordExecCommand": "%s",\n' "$exec_cmd"
+      # Bake the ENV into the exec command so pg-token.sh scopes the token to the
+      # right subscription -> the right identity is used for THIS server, no matter
+      # which az account is active. (e.g. "<path>/pg-token.sh test")
+      printf '      "PasswordExecCommand": "%s %s",\n' "$PG_TOKEN_SCRIPT" "$e"
       printf '      "PasswordExecExpiration": 3600\n'
       printf '    }'
     done
@@ -309,39 +321,31 @@ main() {
   # --- dependencies & identity -------------------------------------------
   [ -z "$AZ" ] && { log_error "Azure CLI (az) not found. Install it or set AZ_BIN."; exit 1; }
 
-  # Cache the enabled-subscription list once (used for the landscape + auto-switch).
+  # Cache the enabled-subscription list once (used for the landscape display and
+  # to confirm the env's owning account is logged in).
   # Format per line: "<user>\t<subscription>\t<isDefault>"
   AZ_ACCOUNTS="$("$AZ" account list --query "[?state=='Enabled'].[user.name, name, isDefault]" -o tsv 2>/dev/null || true)"
 
-  # Gate on having ANY logged-in account, not on having an ACTIVE one — you can
-  # be logged into account A while B (which was active) is logged out, leaving no
-  # active account but a usable session. The per-env auto-switch picks the right one.
+  # Gate on having ANY logged-in account. We do NOT care which one is "active":
+  # tokens are requested per-env with `--subscription`, so the right identity is
+  # selected by the subscription that owns the env, not by the active account.
   if [ -z "$AZ_ACCOUNTS" ]; then
     log_error "No Azure accounts logged in. Run:  az login"
     exit 1
   fi
-  local me; me="$("$AZ" account show --query user.name -o tsv 2>/dev/null || true)"
-  if [ -n "$me" ]; then
-    log_info "Active Azure identity: ${BOLD}${me}${NC}  (token will be attributed to this user)"
-  else
-    log_warning "No ${BOLD}active${NC} Azure account (one was logged out) — pick an env and it will switch to the right one."
-  fi
 
   # Show which identities are logged in and which Dialogporten subs each holds.
+  # No "(active)" marker — the active account is irrelevant here; the env you pick
+  # determines which identity's token is fetched.
   local dp_accounts
   dp_accounts="$(printf '%s\n' "$AZ_ACCOUNTS" | grep -i 'Dialogporten-' || true)"
   if [ -n "$dp_accounts" ]; then
-    log_info "Logged-in accounts (Dialogporten subscriptions):"
-    # group by user, mark the active one
+    log_info "Logged-in Dialogporten accounts (the right one is chosen per environment):"
     printf '%s\n' "$dp_accounts" | awk -F'\t' '
-      { subs[$1] = subs[$1] (subs[$1]?", ":"") $2; if ($3=="True") active[$1]=1 }
-      END { for (u in subs) printf "%s\t%s\t%s\n", (u in active?"*":" "), u, subs[u] }
-    ' | while IFS=$'\t' read -r mark user subs; do
-      if [ "$mark" = "*" ]; then
-        echo -e "    ${GREEN}●${NC} ${BOLD}${user}${NC} → ${subs}  ${GREEN}(active)${NC}"
-      else
-        echo -e "      ${user} → ${subs}"
-      fi
+      { subs[$1] = subs[$1] (subs[$1]?", ":"") $2 }
+      END { for (u in subs) printf "%s\t%s\n", u, subs[u] }
+    ' | while IFS=$'\t' read -r user subs; do
+      echo -e "      ${BOLD}${user}${NC} → ${subs}"
     done
   fi
   echo
@@ -366,9 +370,18 @@ main() {
   fi
 
   # --- environment (show friendly labels, return canonical value) ---------
+  # Envs whose owning account isn't logged in are shown red with a "(not logged in)"
+  # marker — still selectable (the login check is a best-effort snapshot; picking one
+  # yields the clear membership/login guidance below rather than a hard block).
   if [ -z "$environment" ]; then
     local env_labels=() ev chosen
-    for ev in "${VALID_ENVIRONMENTS[@]}"; do env_labels+=("$(env_label "$ev")"); done
+    for ev in "${VALID_ENVIRONMENTS[@]}"; do
+      if subscription_logged_in "$ev"; then
+        env_labels+=("$(env_label "$ev")")
+      else
+        env_labels+=("$(printf '%b' "${RED}$(env_label "$ev")  (not logged in)${NC}")")
+      fi
+    done
     chosen=$(prompt_choice "Select environment:" "${env_labels[@]}")
     local i
     for i in "${!env_labels[@]}"; do
@@ -377,24 +390,24 @@ main() {
   fi
   validate_in "$environment" "${VALID_ENVIRONMENTS[@]}" || { log_error "Invalid env: $environment"; exit 1; }
 
-  # --- auto-switch active Azure account to the env's subscription ----------
+  # --- resolve the env's owning identity (NO active-account switch) --------
   # Each Dialogporten env lives in a known subscription owned by a specific
-  # identity; `az account set` flips the active account when that sub belongs to
-  # a different logged-in identity. Only switch if the target sub is available
-  # and not already active; otherwise leave it and let the membership check guide.
-  local target_sub active_sub
+  # logged-in identity. We never run `az account set`; instead we read the
+  # owning identity from that subscription and (later) fetch the token scoped to
+  # it with `--subscription`. `az account show --subscription <sub>` reports the
+  # owning user WITHOUT changing the active account.
+  local target_sub me
   target_sub="$(env_subscription "$environment")"
-  active_sub="$("$AZ" account show --query name -o tsv 2>/dev/null || true)"
-  if [ -n "$target_sub" ] && [ "$target_sub" != "$active_sub" ]; then
+  if [ -n "$target_sub" ]; then
     if printf '%s\n' "$AZ_ACCOUNTS" | awk -F'\t' -v s="$target_sub" '$2==s{found=1} END{exit !found}'; then
-      if "$AZ" account set --subscription "$target_sub" >/dev/null 2>&1; then
-        me="$("$AZ" account show --query user.name -o tsv 2>/dev/null)"
-        log_success "Switched active Azure account to ${BOLD}${me}${NC} (subscription ${target_sub})"
+      me="$("$AZ" account show --subscription "$target_sub" --query user.name -o tsv 2>/dev/null || true)"
+      if [ -n "$me" ]; then
+        log_success "Will use ${BOLD}${me}${NC} for ${BOLD}$(env_label "$environment")${NC} (subscription ${target_sub}) — no account switch."
       else
-        log_warning "Could not switch to ${target_sub}; continuing with the current account."
+        log_warning "Couldn't read the identity for ${target_sub}; the token fetch will still try it."
       fi
     else
-      log_warning "${target_sub} isn't in your logged-in accounts — you may need: az login"
+      log_warning "${target_sub} isn't in your logged-in accounts — you may need:  az login"
     fi
   fi
 
@@ -414,7 +427,12 @@ main() {
   # you haven't activated. A "type prod to continue" prompt would be theater.
 
   # --- best-effort membership pre-check (terminal CAN show this) ----------
-  local my_oid; my_oid="$("$AZ" ad signed-in-user show --query id -o tsv 2>/dev/null || true)"
+  # Check the ENV's OWNING identity ($me), not the active signed-in user — we
+  # don't switch accounts, so the active user may be the wrong one. Resolve that
+  # identity's object id via Graph (`az ad user show --id <upn>`), which works
+  # from any logged-in account, then check group membership for it.
+  local my_oid=""
+  [ -n "$me" ] && my_oid="$("$AZ" ad user show --id "$me" --query id -o tsv 2>/dev/null || true)"
   if [ -n "$my_oid" ]; then
     local is_member
     is_member="$("$AZ" ad group member check --group "$group" --member-id "$my_oid" --query value -o tsv 2>/dev/null || true)"
@@ -426,14 +444,12 @@ main() {
       if [ "$tier" = "read" ]; then
         log_info  "Read access is standing membership. Likely causes:"
         log_info  "  • You haven't been granted read access yet → ask to be added to the group."
-        log_info  "  • The account auto-switch couldn't reach the right account for this env:"
-        echo      "      az account list -o table   /   az account set --subscription \"<name>\"   /   az login"
+        log_info  "  • You're not logged into the right account for this env → ${BOLD}az login${NC} as ${me}."
       else
         log_info  "${BOLD}${tier}${NC} access is granted on demand via PIM. Likely causes:"
         log_info  "  • You're eligible but haven't activated yet (or it expired) → ${PIM_ACTIVATION_HINT}"
         log_info  "  • You may not be eligible for this role at all → request ${tier} access if you need it."
-        log_info  "  • Already activated and on the right account? Then re-check the account:"
-        echo      "      az account list -o table   /   az account set --subscription \"<name>\"   /   az login"
+        log_info  "  • Already activated? Make sure you're logged in as ${BOLD}${me}${NC} (az login)."
       fi
       exit 1
     elif [ "$is_member" = "true" ]; then
@@ -446,10 +462,10 @@ main() {
 
   echo
   case "$client" in
-    token)        handoff_token "$port" "$group" ;;
-    psql)         handoff_psql "$port" "$group" ;;
+    token)        handoff_token "$port" "$group" "$environment" ;;
+    psql)         handoff_psql "$port" "$group" "$environment" ;;
     # accept the old client aliases (and -c flag values) for compatibility
-    pgadmin|rider|raw) handoff_token "$port" "$group" ;;
+    pgadmin|rider|raw) handoff_token "$port" "$group" "$environment" ;;
     *) log_error "Unknown client: $client"; exit 1 ;;
   esac
 }
@@ -486,13 +502,16 @@ SETUP=\"/Applications/pgAdmin 4.app/Contents/Resources/web/setup.py\"
   echo "$import_cmd"
   echo
   log_info "After running it, ${BOLD}restart pgAdmin${NC} — the server tree only shows imported servers after a restart."
+  log_info "Re-importing later? Each server's token command is env-scoped (e.g. ${BOLD}pg-token.sh test${NC}); if you imported before this was added, re-import with ${BOLD}--replace${NC} to pick it up."
 }
 
 # --- psql: launch directly ------------------------------------------------
 handoff_psql() {
-  local port=$1 group=$2
-  local token; token="$("$PG_TOKEN_SCRIPT" 2>/dev/null || true)"
-  [ -z "$token" ] && { log_error "Failed to get a token. Is your Azure session active? Run: az login"; exit 1; }
+  local port=$1 group=$2 env=$3
+  # Pass the env so the token is scoped to that env's subscription (right identity,
+  # no active-account switch).
+  local token; token="$("$PG_TOKEN_SCRIPT" "$env" 2>/dev/null || true)"
+  [ -z "$token" ] && { log_error "Failed to get a token for ${me:-this env}. Run: az login (as the right identity)."; exit 1; }
   log_info "Launching psql..."
   PGPASSWORD="$token" PGUSER="$group" \
     psql "host=localhost port=${port} dbname=${DB_NAME} sslmode=require" || true
@@ -503,9 +522,11 @@ handoff_psql() {
 # connection details and the token to paste as the password. For pgAdmin
 # auto-refresh (no pasting), use the "set up all pgAdmin servers" option.
 handoff_token() {
-  local port=$1 group=$2
-  local token; token="$("$PG_TOKEN_SCRIPT" 2>/dev/null || true)"
-  [ -z "$token" ] && { log_error "Failed to get a token. Is your Azure session active? Run: az login"; exit 1; }
+  local port=$1 group=$2 env=$3
+  # Pass the env so the token is scoped to that env's subscription (right identity,
+  # no active-account switch).
+  local token; token="$("$PG_TOKEN_SCRIPT" "$env" 2>/dev/null || true)"
+  [ -z "$token" ] && { log_error "Failed to get a token for ${me:-this env}. Run: az login (as the right identity)."; exit 1; }
   print_box "Connection details — paste the token as the password" "\
   Host      ${BOLD}localhost${NC}
   Port      ${BOLD}${port}${NC}
