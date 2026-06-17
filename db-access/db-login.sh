@@ -29,15 +29,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PG_TOKEN_SCRIPT="${SCRIPT_DIR}/pg-token.sh"
 readonly DB_NAME="dialogporten"
 
-# How to activate write/admin access via Entra PIM. Read is standing membership
-# (no PIM); write/admin are PIM-eligible and activated on demand.
+# How to activate write/migrator access via Entra PIM. Read is standing membership
+# (no PIM); write/migrator are PIM-eligible and activated on demand.
 # TODO: replace with the canonical org PIM activation URL / az command.
 readonly PIM_ACTIVATION_HINT="Activate it in Entra PIM (Privileged Identity Management → Groups)."
 
 # Canonical env values (match forward.sh). yt01 = perf, lives in the test
 # subscription; low focus for now but included for completeness.
 readonly VALID_ENVIRONMENTS=("test" "yt01" "staging" "prod")
-readonly VALID_TIERS=("read" "write" "admin")
+# Tier vocabulary tracks altinn-platform#3407: read=Readonly, write=Readwrite,
+# migrator=Migrator (DDL/schema changes; renamed from the earlier "admin").
+readonly VALID_TIERS=("read" "write" "migrator")
 
 # NOTE: stock macOS ships bash 3.2 (no associative arrays), and forward.sh is
 # bash-3.2 compatible, so we use case-based lookups instead of `declare -A`.
@@ -79,25 +81,31 @@ env_port() {
 }
 
 # env:tier -> Entra group name (the PG username you log in as).
-# staging currently REUSES the prod groups. This function is the SINGLE swap
-# point — replace the names here for the real altinn-platform#3407 groups.
+# staging currently REUSES the prod groups. This function is the SINGLE swap point.
+#
+# SWAP POINT (altinn-platform#3407): the canonical groups these temp groups map to are
+#   read     -> "Altinn Product Dialogporten: PostgreSQL Readonly <Test|Prod>"
+#   write    -> "Altinn Product Dialogporten: PostgreSQL Readwrite <Test|Prod>"
+#   migrator -> "Altinn Product Dialogporten: PostgreSQL Migrator <Test|Prod>"
+# (test/yt01 -> Test groups; staging/prod -> Prod groups). They don't exist as PG roles
+# yet, so the values below are the TEMP groups. Replace each string when #3407 lands.
 group_for() {
   case "$1:$2" in
-    test:read)     echo "Altinn Product Dialogporten: Developers Dev" ;;
-    test:write)    echo "Dialogporten-Test-Operations" ;;
-    test:admin)    echo "Dialogporten-Test-UserAdmins" ;;
+    test:read)        echo "Altinn Product Dialogporten: Developers Dev" ;;
+    test:write)       echo "Dialogporten-Test-Operations" ;;
+    test:migrator)    echo "Dialogporten-Test-UserAdmins" ;;
     # yt01 (perf) shares the test subscription and reuses the TEST groups,
     # both now and after #3407 lands.
-    yt01:read)     echo "Altinn Product Dialogporten: Developers Dev" ;;
-    yt01:write)    echo "Dialogporten-Test-Operations" ;;
-    yt01:admin)    echo "Dialogporten-Test-UserAdmins" ;;
-    staging:read)  echo "Altinn Product Dialogporten: Developers Prod" ;;
-    staging:write) echo "Dialogporten-Prod-Operations" ;;
-    staging:admin) echo "Altinn Product Dialogporten: Admins Prod" ;;
-    prod:read)     echo "Altinn Product Dialogporten: Developers Prod" ;;
-    prod:write)    echo "Dialogporten-Prod-Operations" ;;
-    prod:admin)    echo "Altinn Product Dialogporten: Admins Prod" ;;
-    *)             echo "" ;;
+    yt01:read)        echo "Altinn Product Dialogporten: Developers Dev" ;;
+    yt01:write)       echo "Dialogporten-Test-Operations" ;;
+    yt01:migrator)    echo "Dialogporten-Test-UserAdmins" ;;
+    staging:read)     echo "Altinn Product Dialogporten: Developers Prod" ;;
+    staging:write)    echo "Dialogporten-Prod-Operations" ;;
+    staging:migrator) echo "Altinn Product Dialogporten: Admins Prod" ;;
+    prod:read)        echo "Altinn Product Dialogporten: Developers Prod" ;;
+    prod:write)       echo "Dialogporten-Prod-Operations" ;;
+    prod:migrator)    echo "Altinn Product Dialogporten: Admins Prod" ;;
+    *)                echo "" ;;
   esac
 }
 
@@ -140,20 +148,20 @@ env_word() {
 }
 
 export_pgadmin() {
-  local include_admin=$1     # "yes"/"no"
+  local include_migrator=$1     # "yes"/"no"
   local exec_cmd="$PG_TOKEN_SCRIPT"
-  # tier -> privilege ordinal (read<write<admin) so servers sort least->most.
-  local tiers=("read" "write" "admin")
+  # tier -> privilege ordinal (read<write<migrator) so servers sort least->most.
+  local tiers=("read" "write" "migrator")
   local n=0 first=1 e t group port ord
 
   local genv
   printf '{\n  "Servers": {\n'
   for e in "${VALID_ENVIRONMENTS[@]}"; do
     for t in "${tiers[@]}"; do
-      [ "$t" = "admin" ] && [ "$include_admin" = "no" ] && continue
+      [ "$t" = "migrator" ] && [ "$include_migrator" = "no" ] && continue
       group="$(group_for "$e" "$t")"; [ -z "$group" ] && continue
       port="$(env_port "$e")"; [ -z "$port" ] && continue
-      case "$t" in read) ord=1 ;; write) ord=2 ;; admin) ord=3 ;; esac
+      case "$t" in read) ord=1 ;; write) ord=2 ;; migrator) ord=3 ;; esac
       # env ordinal (test<yt01<staging<prod) so groups sort test->prod, not alphabetically.
       case "$e" in test) genv=1 ;; yt01) genv=2 ;; staging) genv=3 ;; prod) genv=4 ;; *) genv=9 ;; esac
       n=$((n+1))
@@ -251,17 +259,17 @@ PostgreSQL database, using group-based access tiers. Run forward.sh FIRST to
 establish the SSH tunnel.
 
 Usage: $0 [-e ENV] [-t TIER] [-c CLIENT]
-       $0 --export-pgadmin [--no-admin] > servers.json
+       $0 --export-pgadmin [--no-migrator] > servers.json
 
   -e, --env         ${VALID_ENVIRONMENTS[*]}
-  -t, --tier        ${VALID_TIERS[*]}   (read=SELECT, write=DML, admin=DDL)
+  -t, --tier        ${VALID_TIERS[*]}   (read=SELECT, write=DML, migrator=DDL)
   -c, --client      token | psql   (default: prompt; 'token' = copy a token to paste into
                     pgAdmin/Rider/etc. Old values pgadmin|rider|raw are accepted as 'token'.)
   --export-pgadmin  Emit a pgAdmin Import/Export servers JSON to stdout (all envs/tiers,
                     per-env groups, token exec command wired to this machine). No prompts.
                     Recommended for pgAdmin users: import once, then pgAdmin auto-refreshes
                     the token. (Interactive equivalent: the last client menu option.)
-  --no-admin        With --export-pgadmin: omit the admin/DDL tier servers.
+  --no-migrator     With --export-pgadmin: omit the migrator/DDL tier servers.
   -h, --help
 
 Interactive when flags are omitted (asks client, then environment, then tier).
@@ -277,14 +285,14 @@ EOF
 # Main
 # =========================================================================
 main() {
-  local environment="" tier="" client="" export_mode="" include_admin="yes"
+  local environment="" tier="" client="" export_mode="" include_migrator="yes"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -e|--env)         environment="${2:-}"; shift 2 ;;
       -t|--tier)        tier="${2:-}"; shift 2 ;;
       -c|--client)      client="${2:-}"; shift 2 ;;
       --export-pgadmin) export_mode="yes"; shift ;;
-      --no-admin)       include_admin="no"; shift ;;
+      --no-migrator)    include_migrator="no"; shift ;;
       -h|--help)        print_help; exit 0 ;;
       *) log_error "Unknown option: $1"; print_help; exit 1 ;;
     esac
@@ -292,7 +300,7 @@ main() {
 
   # Generator mode: emit servers.json to stdout and exit (no prompts, no az needed).
   if [ "$export_mode" = "yes" ]; then
-    export_pgadmin "$include_admin"
+    export_pgadmin "$include_migrator"
     exit 0
   fi
 
@@ -353,7 +361,7 @@ main() {
   # Generator path: write the servers.json file + import instructions, then done.
   # Doesn't need env/tier/membership — it produces all envs and tiers.
   if [ "$client" = "export" ]; then
-    interactive_export_pgadmin "$include_admin"
+    interactive_export_pgadmin "$include_migrator"
     exit 0
   fi
 
@@ -414,7 +422,7 @@ main() {
       log_error "Identity '${me}' is NOT currently in group '${group}'."
       # A bare 'false' has several causes the check can't distinguish; list the
       # realistic ones per tier. read = standing membership (no PIM);
-      # write/admin = PIM-eligible, activated on demand.
+      # write/migrator = PIM-eligible, activated on demand.
       if [ "$tier" = "read" ]; then
         log_info  "Read access is standing membership. Likely causes:"
         log_info  "  • You haven't been granted read access yet → ask to be added to the group."
@@ -448,9 +456,9 @@ main() {
 
 # --- Interactive generator: write servers.json + ready-to-run import command -
 interactive_export_pgadmin() {
-  local include_admin=$1
+  local include_migrator=$1
   local out="./dp-pgadmin-servers.json"
-  export_pgadmin "$include_admin" > "$out"
+  export_pgadmin "$include_migrator" > "$out"
   local abs_out; abs_out="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
   local count; count=$(grep -c '"Name"' "$out")
   log_success "Wrote ${count} pgAdmin servers to ${BOLD}${abs_out}${NC}"
