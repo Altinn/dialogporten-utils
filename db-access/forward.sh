@@ -250,6 +250,12 @@ Options:
                           MOTD, tunnel holds the terminal — press Ctrl-C to stop. Use this
                           only if you need to run commands ON the jumper itself.
 
+    --no-prompt           Never prompt; run unattended. REQUIRES -e (no safe env default).
+                          Fills the rest with defaults: -t postgres, the per-env local port,
+                          and tunnel-only mode. If -n is omitted and multiple servers match,
+                          it errors (won't guess between e.g. postgres / postgres2) — pass -n.
+                          Good for backgrounding: forward.sh --no-prompt -e staging &
+
     -h, --help           Show this help message
 
 Prerequisites:
@@ -352,6 +358,45 @@ check_dependencies() {
     log_success "Azure CLI is installed"
 }
 
+# Cache of enabled accounts, "<user>\t<subscription>" per line. Populated by
+# show_account_landscape, reused to mark envs whose owning account isn't logged in.
+AZ_ACCOUNTS=""
+
+# True if the subscription that owns $1 (an env) is among the logged-in accounts.
+subscription_logged_in() {
+    local sub_name
+    sub_name=$(get_subscription_name "$1")
+    [ -z "$sub_name" ] && return 1
+    printf '%s\n' "$AZ_ACCOUNTS" | awk -F'\t' -v s="$sub_name" '$2==s{f=1} END{exit !f}'
+}
+
+# Surface which Dialogporten accounts are logged in (mirrors db-login.sh). Since we
+# scope every call by --subscription and never switch the active account, the active
+# one is irrelevant — what matters is being logged into the account that OWNS the env
+# you target. Showing the landscape up front makes a partial login obvious before the
+# tunnel fails deep in JIT/SSH. Returns 0 if any Dialogporten account is logged in.
+show_account_landscape() {
+    AZ_ACCOUNTS=$(az account list --query "[?state=='Enabled'].[user.name, name]" -o tsv 2>/dev/null || true)
+    if [ -z "$AZ_ACCOUNTS" ]; then
+        log_warning "No Azure accounts logged in. Run:  az login"
+        return 1
+    fi
+    local dp_accounts
+    dp_accounts=$(printf '%s\n' "$AZ_ACCOUNTS" | grep -i 'Dialogporten' || true)
+    if [ -z "$dp_accounts" ]; then
+        log_warning "Logged in, but no Dialogporten subscriptions found — you may need:  az login"
+        return 1
+    fi
+    log_info "Logged-in Dialogporten accounts (the env you pick must be owned by one of these):"
+    printf '%s\n' "$dp_accounts" | awk -F'\t' '
+        { subs[$1] = subs[$1] (subs[$1]?", ":"") $2 }
+        END { for (u in subs) printf "%s\t%s\n", u, subs[u] }
+    ' | while IFS=$'\t' read -r user subs; do
+        echo -e "      ${BOLD}${user}${NC} → ${subs}"
+    done
+    return 0
+}
+
 # Get subscription name from environment
 get_subscription_name() {
     local env=$1
@@ -378,7 +423,8 @@ get_subscription_id() {
     sub_id=$(az account show --subscription "$subscription_name" --query id -o tsv 2>/dev/null)
 
     if [ -z "$sub_id" ]; then
-        log_error "Could not find subscription '$subscription_name'. Please ensure you are logged in to the correct Azure account."
+        log_error "Not logged into the account that owns '${subscription_name}' (needed for env '${env}')."
+        log_info  "See the logged-in accounts listed above. Fix with:  az login  (as the owning identity)."
         exit 1
     fi
 
@@ -459,10 +505,11 @@ configure_jit_access() {
 
     log_success "Public IP detected: $my_ip"
 
-    # Get VM details
+    # Get VM details. Scope every call with --subscription (never `az account set`)
+    # so the right identity is used even when a different account is active.
     log_info "Fetching VM details..."
     local vm_id
-    vm_id=$(az vm show --resource-group "$resource_group" --name "$vm_name" --query "id" -o tsv)
+    vm_id=$(az vm show --subscription "$subscription_id" --resource-group "$resource_group" --name "$vm_name" --query "id" -o tsv)
     if [ -z "$vm_id" ]; then
         log_error "Failed to get VM ID for $vm_name in resource group $resource_group"
         exit 1
@@ -470,7 +517,7 @@ configure_jit_access() {
     log_success "Found VM with ID: $vm_id"
 
     local location
-    location=$(az vm show --resource-group "$resource_group" --name "$vm_name" --query "location" -o tsv)
+    location=$(az vm show --subscription "$subscription_id" --resource-group "$resource_group" --name "$vm_name" --query "location" -o tsv)
     if [ -z "$location" ]; then
         log_error "Failed to get location for VM $vm_name"
         exit 1
@@ -507,7 +554,7 @@ EOF
     echo
 
     local jit_response
-    if ! jit_response=$(az rest --method post --uri "$endpoint" --headers "Content-Type=application/json" --body "@$temp_file" 2>&1); then
+    if ! jit_response=$(az rest --subscription "$subscription_id" --method post --uri "$endpoint" --headers "Content-Type=application/json" --body "@$temp_file" 2>&1); then
         log_error "Failed to configure JIT access. Error: $jit_response"
         log_info "Please ensure you have the necessary permissions and that JIT access is enabled for this VM"
         exit 1
@@ -526,6 +573,7 @@ discover_server() {
     local db_type=$1
     local env=$2
     local subscription_id=$3
+    local no_prompt=${4:-false}
 
     local all_names
     if [ "$db_type" = "postgres" ]; then
@@ -541,6 +589,21 @@ discover_server() {
     if [ -z "$all_names" ]; then
         log_error "No ${db_type} server found in environment '${env}'"
         exit 1
+    fi
+
+    # Under --no-prompt, refuse to silently pick between multiple matches (e.g.
+    # postgres vs postgres2): that ambiguity is exactly where a wrong guess hurts.
+    # Require an explicit -n in that case.
+    if [ "$no_prompt" = "true" ]; then
+        local count
+        count=$(printf '%s\n' "$all_names" | sed '/^$/d' | wc -l | tr -d ' ')
+        if [ "$count" -gt 1 ]; then
+            log_error "Multiple ${db_type} servers found in '${env}' — pass -n NAME to choose (--no-prompt won't guess):" >&2
+            printf '%s\n' "$all_names" | sed '/^$/d; s/^/    /' >&2
+            exit 1
+        fi
+        printf '%s\n' "$all_names" | sed '/^$/d'
+        return
     fi
 
     local label
@@ -612,17 +675,23 @@ setup_ssh_tunnel() {
     local remote_port=$3
     local local_port=${4:-$remote_port}
     local shell_mode=${5:-false}
+    local subscription_id=${6:-}
 
+    # Scope `az ssh vm` with --subscription so the Entra SSH cert is minted as the
+    # identity owning that subscription — works even when a different az account is
+    # active, and never switches the active account.
     log_info "Connecting to ${hostname}:${remote_port} via local port ${local_port}"
     if [ "$shell_mode" = "true" ]; then
         log_info "Interactive jumper shell; type ${BOLD}exit${NC} to close the tunnel."
         az ssh vm \
+            --subscription "$subscription_id" \
             -g "$(get_resource_group "$env")" \
             -n "$(get_jumper_vm_name "$env")" \
             -- -tt -L "${local_port}:${hostname}:${remote_port}"
     else
         log_success "Tunnel up on ${BOLD}localhost:${local_port}${NC} — press ${BOLD}Ctrl-C${NC} to stop."
         az ssh vm \
+            --subscription "$subscription_id" \
             -g "$(get_resource_group "$env")" \
             -n "$(get_jumper_vm_name "$env")" \
             -- -N -L "${local_port}:${hostname}:${remote_port}"
@@ -659,6 +728,7 @@ main() {
     local local_port=$3
     local name_override=${4:-}
     local shell_mode=${5:-false}
+    local no_prompt=${6:-false}
 
     # Add trap to handle script termination
     trap 'echo -e "\n${YELLOW}⚠${NC} Operation interrupted"; exit 130' INT TERM
@@ -666,13 +736,33 @@ main() {
     log_title "Database Connection Forwarder"
 
     check_dependencies
+    show_account_landscape || true   # informational; the per-env resolve enforces it
+    echo
+
+    # --no-prompt: never prompt. Require an explicit env (no safe default — test/
+    # staging/prod are not interchangeable). Other values get non-interactive
+    # defaults below (type=postgres, per-env port, connect-mode=tunnel-only); an
+    # ambiguous server with no -n fails in discover_server rather than guessing.
+    if [ "$no_prompt" = "true" ] && [ -z "$environment" ]; then
+        log_error "--no-prompt requires an explicit environment: -e ${VALID_ENVIRONMENTS[*]}"
+        exit 1
+    fi
 
     # If environment is not provided, prompt for it (show friendly labels,
-    # return the canonical env value).
+    # return the canonical env value). Envs whose owning account isn't logged in
+    # are shown in red with a "(not logged in)" marker — still selectable (the
+    # login check is a best-effort snapshot; picking one yields the clear az-login
+    # error rather than a hard block that a false negative could trap you behind).
     if [ -z "$environment" ]; then
         log_info "Please select target environment:"
         local env_labels=() ev chosen_label
-        for ev in "${VALID_ENVIRONMENTS[@]}"; do env_labels+=("$(env_label "$ev")"); done
+        for ev in "${VALID_ENVIRONMENTS[@]}"; do
+            if subscription_logged_in "$ev"; then
+                env_labels+=("$(env_label "$ev")")
+            else
+                env_labels+=("$(printf '%b' "${RED}$(env_label "$ev")  (not logged in)${NC}")")
+            fi
+        done
         chosen_label=$(prompt_selection "Environment (1-${#VALID_ENVIRONMENTS[@]}): " "${env_labels[@]}")
         # map the chosen label back to its canonical env value by index
         local i
@@ -682,39 +772,58 @@ main() {
     fi
     validate_environment "$environment"
 
-    # If db_type is not provided, prompt for it
+    # If db_type is not provided, prompt for it — or default to postgres under
+    # --no-prompt (the common case; pass -t redis to override).
     if [ -z "$db_type" ]; then
-        log_info "Please select database type:"
-        db_type=$(prompt_selection "Database (1-${#VALID_DB_TYPES[@]}): " "${VALID_DB_TYPES[@]}")
+        if [ "$no_prompt" = "true" ]; then
+            db_type="postgres"
+            log_info "No -t given; defaulting to ${BOLD}postgres${NC} (--no-prompt)."
+        else
+            log_info "Please select database type:"
+            db_type=$(prompt_selection "Database (1-${#VALID_DB_TYPES[@]}): " "${VALID_DB_TYPES[@]}")
+        fi
     fi
     validate_db_type "$db_type"
 
-    # If local_port is not provided, prompt for it
+    # If local_port is not provided: use the per-env default silently under
+    # --no-prompt, otherwise prompt (with the default pre-filled).
     if [ -z "$local_port" ]; then
         # postgres uses a per-env local port (avoids multi-env collisions); redis keeps its default
         default_port=$([[ "$db_type" == "postgres" ]] && postgres_local_port "$environment" || echo "$DEFAULT_REDIS_PORT")
-        while true; do
-            log_info "Local port to bind on localhost (127.0.0.1) for ${BOLD}$(env_label "$environment")${NC} ${db_type}"
-            read -rp "Port [press Enter for default ${default_port}]: " local_port
-            local_port=${local_port:-$default_port}
+        if [ "$no_prompt" = "true" ]; then
+            local_port="$default_port"
+            log_info "No -p given; binding default port ${BOLD}${local_port}${NC} (--no-prompt)."
+            validate_port "$local_port" || exit 1
+        else
+            while true; do
+                log_info "Local port to bind on localhost (127.0.0.1) for ${BOLD}$(env_label "$environment")${NC} ${db_type}"
+                read -rp "Port [press Enter for default ${default_port}]: " local_port
+                local_port=${local_port:-$default_port}
 
-            if validate_port "$local_port"; then
-                break
-            fi
-        done
+                if validate_port "$local_port"; then
+                    break
+                fi
+            done
+        fi
     else
         validate_port "$local_port" || exit 1
     fi
 
-    # Resolve subscription and discover server name before showing confirmation
+    # Resolve the env's subscription. We do NOT `az account set` — every az call
+    # below is scoped with --subscription instead, so the right identity is used
+    # without switching the active account (matches db-login.sh / pg-token.sh).
+    # (get_subscription_id already errored out above if the owning account isn't
+    # logged in, so by here the identity resolves.)
     local subscription_id
     subscription_id=$(get_subscription_id "$environment")
-    az account set --subscription "$subscription_id" >/dev/null 2>&1
-    log_success "Azure subscription set"
+    local sub_identity
+    sub_identity=$(az account show --subscription "$subscription_id" --query user.name -o tsv 2>/dev/null || true)
+    [ -n "$sub_identity" ] && \
+        log_success "Using ${BOLD}${sub_identity}${NC} for ${BOLD}$(env_label "$environment")${NC} (no account switch)"
 
     # Discover/select server if no explicit name was given
     if [ -z "$name_override" ]; then
-        name_override=$(discover_server "$db_type" "$environment" "$subscription_id")
+        name_override=$(discover_server "$db_type" "$environment" "$subscription_id" "$no_prompt")
     fi
 
     # Print confirmation
@@ -725,9 +834,9 @@ Name:        ${BOLD}${name_override}${NC}
 Local Port:  ${BOLD}${local_port:-"<default>"}${NC}"
     echo
 
-    # Confirm + pick tunnel mode in one step. (If --shell was passed explicitly,
-    # honor it and skip the prompt — intent is already stated.)
-    if [ "$shell_mode" != "true" ]; then
+    # Confirm + pick tunnel mode in one step. Skip the prompt when intent is
+    # already stated: --shell (explicit shell) or --no-prompt (tunnel-only).
+    if [ "$shell_mode" != "true" ] && [ "$no_prompt" != "true" ]; then
         echo -e "${BOLD}How do you want to connect?${NC}"
         echo -e "  ${CYAN}1)${NC} Tunnel only        (recommended — port-forward, Ctrl-C to stop)"
         echo -e "  ${CYAN}2)${NC} Tunnel + shell     (also opens an interactive shell on the jumper)"
@@ -793,7 +902,7 @@ ${BOLD}${connection_string/localhost/$'\n'localhost}${NC}"
     fi
 
     # Set up the SSH tunnel
-    setup_ssh_tunnel "$environment" "${hostname}" "${port}" "${local_port:-$port}" "${shell_mode}"
+    setup_ssh_tunnel "$environment" "${hostname}" "${port}" "${local_port:-$port}" "${shell_mode}" "${subscription_id}"
 }
 
 # =========================================================================
@@ -806,6 +915,7 @@ db_type=""
 local_port=""
 name_override=""
 shell_mode="false"   # default: port-forward only (-N), no jumper shell / no MOTD
+no_prompt="false"    # --no-prompt: never prompt; use flags + defaults, else fail
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -834,6 +944,10 @@ while [[ $# -gt 0 ]]; do
             shell_mode="true"
             shift
             ;;
+        --no-prompt)
+            no_prompt="true"
+            shift
+            ;;
         -h|--help)
             print_help
             exit 0
@@ -851,4 +965,4 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Call main with all arguments
-main "${environment:-}" "${db_type:-}" "${local_port:-}" "${name_override:-}" "${shell_mode}"
+main "${environment:-}" "${db_type:-}" "${local_port:-}" "${name_override:-}" "${shell_mode}" "${no_prompt}"
