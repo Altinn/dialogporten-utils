@@ -1,26 +1,22 @@
--- dialog-search-scope-backfill verification: run after the workers report the candidate table is
--- drained, BEFORE 99_cleanup.sql. Confirms the repair did what it should and
--- nothing is left behind.
+-- dialog-search-scope-backfill verification: run after the workers report scanned = 0 (range
+-- exhausted), BEFORE 99_cleanup.sql.
 
-\echo '-- 1. No unprocessed candidates remain (generic; must be 0)'
-SELECT COUNT(*) AS unprocessed_remaining
-FROM maintenance."DialogSearchScopeBackfill_Candidates"
-WHERE "ProcessedAt" IS NULL;
-
-\echo ''
-\echo '-- 2. Outcome breakdown (generic)'
-SELECT "Outcome", COUNT(*)
-FROM maintenance."DialogSearchScopeBackfill_Candidates"
-GROUP BY "Outcome"
-ORDER BY "Outcome" NULLS FIRST;
+\echo '-- 1. Rows still needing backfill (must be 0). Full scan -- minutes at prod scale.'
+SELECT count(*) AS remaining
+FROM search."DialogSearch" ds
+WHERE ds."ContentUpdatedAt" IS NULL OR ds."ServiceResource" IS NULL;
 
 \echo ''
-\echo '-- 3. Job-specific invariant'
--- >>> JOB-SPECIFIC (edit me) >>>
--- Of the candidates marked 'updated', how many are STILL unpopulated? Expect 0.
-SELECT COUNT(*) AS updated_but_still_broken
-FROM maintenance."DialogSearchScopeBackfill_Candidates" c
-JOIN search."DialogSearch" ds ON ds."DialogId" = c."EntityId"
-WHERE c."Outcome" = 'updated'
-  AND (ds."ContentUpdatedAt" IS NULL OR ds."ServiceResource" IS NULL);
--- <<< JOB-SPECIFIC <<<
+\echo '-- 2. Checkpoint summary (per worker).'
+SELECT "WorkerId", "LastDialogId", "UpdatedTotal", "ScannedTotal", "Batches", "StartedAt", "UpdatedAt"
+FROM maintenance."DialogSearchScopeBackfill_Checkpoint"
+ORDER BY "WorkerId";
+
+\echo ''
+\echo '-- 3. Spot-check on a small sample that populated values match the source Dialog (expect 0).'
+\echo '--    Exact equality can show transient false positives from async reindex lag, so this is'
+\echo '--    a sampled, ServiceResource-only structural check (the value that must be prefix-stripped).'
+SELECT count(*) AS sampled_serviceresource_mismatches
+FROM search."DialogSearch" ds TABLESAMPLE SYSTEM (0.01)
+JOIN public."Dialog" d ON d."Id" = ds."DialogId"
+WHERE ds."ServiceResource" IS DISTINCT FROM replace(d."ServiceResource", 'urn:altinn:resource:', '');

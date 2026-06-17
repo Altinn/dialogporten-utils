@@ -1,21 +1,23 @@
--- dialog-search-scope-backfill sanity check: confirm the candidate-build scan uses the plan you
--- expect BEFORE kicking off the full build against production.
+-- dialog-search-scope-backfill sanity check: confirm a single batch uses the keyset (primary-key)
+-- access path BEFORE running the full job.
 --
--- What to look for in the output:
---   - the index you expect is used (Index Scan / Index Only Scan), NOT a
---     "Parallel Seq Scan" over a large table you did not intend to scan fully
---   - for an Index Only Scan, Heap Fetches close to 0 (run a VACUUM first if not)
---   - selective filters applied at the scan, not late in the plan
+-- What to look for:
+--   - an Index Scan on the DialogSearch primary key for the `DialogId > ... ORDER BY DialogId
+--     LIMIT n` range (NOT a Seq Scan -- the whole point is to walk the PK cheaply), and
+--   - a PK index lookup into "Dialog" for the join.
 --
--- Use plain EXPLAIN (no ANALYZE) so nothing is executed. Only add ANALYZE if you
--- are certain the query has no side effects and the runtime is acceptable.
-
--- >>> JOB-SPECIFIC (edit me) >>>
--- EXPLAIN the inner candidate-selection query from 01_build_candidates.sql (the SELECT, not the
--- INSERT). NOTE: on the first run nearly every row matches (all freshly-added columns are NULL),
--- so a Seq Scan is EXPECTED and correct here -- this is a full-table backfill, not a selective repair.
+-- Plain EXPLAIN (no ANALYZE) so nothing executes. This mirrors the read side of the batch in
+-- maintenance.dialogsearch_scope_backfill_batch; the UPDATE join uses the same access path.
 EXPLAIN
-SELECT ds."DialogId"
-FROM search."DialogSearch" ds
-WHERE ds."ContentUpdatedAt" IS NULL OR ds."ServiceResource" IS NULL;
--- <<< JOB-SPECIFIC <<<
+WITH batch AS (
+    SELECT ds."DialogId"
+    FROM search."DialogSearch" ds
+    WHERE ds."DialogId" > '00000000-0000-0000-0000-000000000000'::uuid
+    ORDER BY ds."DialogId"
+    LIMIT 5000
+)
+SELECT b."DialogId",
+       d."ContentUpdatedAt",
+       replace(d."ServiceResource", 'urn:altinn:resource:', '')
+FROM batch b
+JOIN public."Dialog" d ON d."Id" = b."DialogId";

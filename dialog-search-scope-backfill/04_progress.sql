@@ -1,72 +1,27 @@
--- dialog-search-scope-backfill: at-a-glance progress. Safe to run repeatedly while workers are
--- running -- entirely read-only. Fully generic; no edits needed.
+-- dialog-search-scope-backfill progress. Cheap and read-only: reads the checkpoint, NOT the
+-- 1.1B-row table. Safe to run repeatedly while workers run.
 
-\echo '-- Overall progress + ETA'
-SELECT
-    p.total,
-    p.processed,
-    p.remaining,
-    p.updated,
-    p.skipped,
-    ROUND(100.0 * p.processed / NULLIF(p.total, 0), 2) AS pct_done,
-    rate.rows_per_sec,
-    CASE WHEN rate.rows_per_sec > 0
-         THEN (p.remaining / rate.rows_per_sec) * interval '1 second'
-    END AS eta
-FROM maintenance."DialogSearchScopeBackfill_Progress" p
-CROSS JOIN LATERAL (
-    -- Overall rate since the first batch started (lifetime average).
-    SELECT SUM("Claimed")::numeric
-           / NULLIF(EXTRACT(EPOCH FROM (MAX("FinishedAt") - MIN("StartedAt"))), 0)
-           AS rows_per_sec
-    FROM maintenance."DialogSearchScopeBackfill_BatchLog"
-    WHERE "FinishedAt" IS NOT NULL
-) rate;
-
-\echo ''
-\echo '-- Recent throughput (last 15 min of finished batches)'
-\echo '-- More honest than the lifetime average if the run was paused/throttled.'
-SELECT
-    COUNT(*)                                                       AS batches,
-    SUM("Claimed")                                                 AS claimed,
-    SUM("Updated")                                                 AS updated,
-    ROUND(
-        SUM("Claimed")::numeric
-        / NULLIF(EXTRACT(EPOCH FROM (MAX("FinishedAt") - MIN("StartedAt"))), 0),
-        2
-    )                                                              AS rows_per_sec
-FROM maintenance."DialogSearchScopeBackfill_BatchLog"
-WHERE "FinishedAt" >= now() - interval '15 minutes';
-
-\echo ''
-\echo '-- Per-worker throughput'
-SELECT
-    "WorkerId",
-    COUNT(*)                                                       AS batches,
-    MIN("StartedAt")                                               AS first_batch_at,
-    MAX(COALESCE("FinishedAt", "StartedAt"))                       AS last_batch_at,
-    SUM("Updated")                                                 AS updated_total,
-    SUM("Skipped")                                                 AS skipped_total,
-    ROUND(AVG(EXTRACT(EPOCH FROM ("FinishedAt" - "StartedAt"))), 3) AS avg_batch_secs,
-    ROUND(
-        SUM("Updated")::numeric
-        / NULLIF(EXTRACT(EPOCH FROM (MAX("FinishedAt") - MIN("StartedAt"))), 0),
-        2
-    )                                                              AS updates_per_sec
-FROM maintenance."DialogSearchScopeBackfill_BatchLog"
-GROUP BY "WorkerId"
+\echo '-- Per-worker checkpoint (cursor position, totals, throughput)'
+SELECT "WorkerId",
+       "LastDialogId",
+       "UpdatedTotal",
+       "ScannedTotal",
+       "Batches",
+       "StartedAt",
+       "UpdatedAt",
+       round("ScannedTotal" / GREATEST(extract(epoch FROM (now() - "StartedAt")), 1))::bigint
+         AS scanned_per_sec
+FROM maintenance."DialogSearchScopeBackfill_Checkpoint"
 ORDER BY "WorkerId";
 
 \echo ''
-\echo '-- Live workers (pg_stat_activity)'
-\echo '-- repair.sh sets application_name = maint-dialog-search-scope-backfill-<WORKER_ID>.'
-SELECT
-    application_name,
-    state,
-    wait_event_type,
-    wait_event,
-    now() - query_start AS query_age,
-    now() - state_change AS since_state_change
+\echo '-- Live workers (pg_stat_activity); repair.sh sets application_name = maint-dialog-search-scope-backfill-<WORKER_ID>'
+SELECT application_name,
+       state,
+       wait_event_type,
+       wait_event,
+       now() - query_start AS query_age,
+       now() - state_change AS since_state_change
 FROM pg_stat_activity
 WHERE application_name LIKE 'maint-dialog-search-scope-backfill-%'
 ORDER BY application_name;

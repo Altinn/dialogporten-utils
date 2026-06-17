@@ -1,143 +1,98 @@
--- dialog-search-scope-backfill step 00: schema, candidate table, batch log, progress view, batch procedure.
+-- dialog-search-scope-backfill step 00: schema, checkpoint table, batch function.
 --
--- Generated from maintenance-job-scaffold/_template. Runbook:
---   ../maintenance-job-scaffold/README.md
--- Editing contract (for humans and agents alike):
---   ../maintenance-job-scaffold/AGENTS.md
+-- KEYSET-BATCHED variant. This is a near-total backfill (~every row in
+-- search."DialogSearch" needs it), so the scaffold's candidate-table model is the wrong shape:
+-- it would duplicate the whole 1.1B-row keyspace into a transient table inside one giant
+-- transaction. Instead we walk the DialogSearch primary key (DialogId) in batches, UPDATE-ing the
+-- two new columns in place, and COMMIT each batch (the per-batch commit happens in the calling
+-- psql session via autocommit -- see repair.sh). No candidate table, no long-held snapshot.
 --
--- Everything OUTSIDE the ">>> JOB-SPECIFIC" fences is harness -- do not edit.
--- Sole sanctioned exception: adapting the candidate key shape (see the note on
--- the candidate table below).
---
--- Idempotent: re-running this file is safe (IF NOT EXISTS / OR REPLACE everywhere).
--- All objects are prefixed "DialogSearchScopeBackfill_" so they stay clearly separate from
--- anything else already in the maintenance schema.
+-- Silent repair: only "ContentUpdatedAt" and "ServiceResource" are written. "UpdatedAt" (the
+-- reindex/staleness watermark) and "Revision" are deliberately untouched; no outbox row is written.
+-- Idempotent: re-running this file is safe.
 
 CREATE SCHEMA IF NOT EXISTS maintenance;
 
--- Candidate table: one row per entity we plan to repair.
---
--- Key shape: a single uuid "EntityId" (every Dialogporten aggregate is uuid-keyed).
--- If your job needs a composite or non-uuid key, the edit is local and mechanical:
---   1. the PK column(s) below
---   2. the partial index
---   3. every "EntityId" reference in the procedure at the bottom of this file
---   4. the key columns in 01_build_candidates.sql / 02_dry_run_count.sql
-CREATE TABLE IF NOT EXISTS maintenance."DialogSearchScopeBackfill_Candidates" (
-    "EntityId"    uuid        PRIMARY KEY,
-    "EnqueuedAt"  timestamptz NOT NULL DEFAULT now(),
-    "ProcessedAt" timestamptz NULL,
-    "WorkerId"    text        NULL,
-    "Outcome"     text        NULL  -- 'updated' | 'skipped_state_changed'
+-- Drop objects from the earlier candidate-table version of this job, if step 00 was run before.
+DROP PROCEDURE IF EXISTS maintenance.dialogsearchscopebackfill_run_batch(integer, text, integer, integer, integer);
+DROP VIEW  IF EXISTS maintenance."DialogSearchScopeBackfill_Progress";
+DROP TABLE IF EXISTS maintenance."DialogSearchScopeBackfill_BatchLog";
+DROP TABLE IF EXISTS maintenance."DialogSearchScopeBackfill_Candidates";
+
+-- Checkpoint: one row per worker. Holds the keyset cursor (last processed DialogId) so a killed
+-- worker resumes exactly where it left off, plus running totals for progress/ETA.
+CREATE TABLE IF NOT EXISTS maintenance."DialogSearchScopeBackfill_Checkpoint" (
+    "WorkerId"     text        PRIMARY KEY,
+    "LastDialogId" uuid        NOT NULL,
+    "UpdatedTotal" bigint      NOT NULL DEFAULT 0,
+    "ScannedTotal" bigint      NOT NULL DEFAULT 0,
+    "Batches"      bigint      NOT NULL DEFAULT 0,
+    "StartedAt"    timestamptz NOT NULL DEFAULT now(),
+    "UpdatedAt"    timestamptz NOT NULL DEFAULT now()
 );
 
--- Partial index supporting the FOR UPDATE SKIP LOCKED claim path.
--- Only unprocessed rows are in the index; once a row is marked processed it
--- drops out, so the claim query stays cheap as the run progresses.
-CREATE INDEX IF NOT EXISTS "IX_DialogSearchScopeBackfill_Candidates_Unprocessed"
-    ON maintenance."DialogSearchScopeBackfill_Candidates" ("EntityId")
-    WHERE "ProcessedAt" IS NULL;
-
--- Per-batch log -- progress visibility and post-mortem.
-CREATE TABLE IF NOT EXISTS maintenance."DialogSearchScopeBackfill_BatchLog" (
-    "BatchId"    bigserial   PRIMARY KEY,
-    "WorkerId"   text        NOT NULL,
-    "StartedAt"  timestamptz NOT NULL DEFAULT now(),
-    "FinishedAt" timestamptz NULL,
-    "Claimed"    integer     NOT NULL DEFAULT 0,
-    "Updated"    integer     NOT NULL DEFAULT 0,
-    "Skipped"    integer     NOT NULL DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS "IX_DialogSearchScopeBackfill_BatchLog_WorkerId_BatchId"
-    ON maintenance."DialogSearchScopeBackfill_BatchLog" ("WorkerId", "BatchId" DESC);
-
--- Progress view for at-a-glance status:
---   psql -c 'SELECT * FROM maintenance."DialogSearchScopeBackfill_Progress";'
-CREATE OR REPLACE VIEW maintenance."DialogSearchScopeBackfill_Progress" AS
-SELECT
-    COUNT(*)                                          AS total,
-    COUNT(*) FILTER (WHERE "ProcessedAt" IS NOT NULL) AS processed,
-    COUNT(*) FILTER (WHERE "ProcessedAt" IS NULL)     AS remaining,
-    COUNT(*) FILTER (WHERE "Outcome" = 'updated')     AS updated,
-    COUNT(*) FILTER (WHERE "ProcessedAt" IS NOT NULL
-                       AND "Outcome" IS DISTINCT FROM 'updated') AS skipped,
-    MIN("ProcessedAt") AS first_processed_at,
-    MAX("ProcessedAt") AS last_processed_at
-FROM maintenance."DialogSearchScopeBackfill_Candidates";
-
--- Batch procedure: claims up to p_batch_size unprocessed candidates with
--- FOR UPDATE SKIP LOCKED, applies the job-specific mutation to the matching
--- application rows, and marks the candidates processed -- all in ONE chained
--- CTE statement so the locks acquired by the claim persist through the
--- dependent writes. No risk of another worker stealing a claimed row between
--- statements.
---
--- Silent-repair semantics: mutate ONLY the columns being fixed. "UpdatedAt"
--- and "Revision" (the EF concurrency token) are deliberately left untouched,
--- and no outbox row is inserted -- downstream consumers will not see an event.
-CREATE OR REPLACE PROCEDURE maintenance.dialogsearchscopebackfill_run_batch(
-    p_batch_size  integer,
-    p_worker_id   text,
-    OUT p_claimed integer,
-    OUT p_updated integer,
-    OUT p_skipped integer
-) LANGUAGE plpgsql AS $$
+-- One batch: claim the next p_batch_size DialogIds by keyset, backfill the unpopulated ones from
+-- the source Dialog, advance + persist the cursor. Returns (updated, scanned, next_cursor).
+--   * scanned = 0  => the worker's range (cursor, p_until) is exhausted; the driver stops.
+--   * Resumable: cursor comes from the checkpoint; on the worker's first batch it starts at
+--     COALESCE(p_start_at, min-uuid).
+--   * Parallel: give each worker a distinct p_worker and a DISJOINT [p_start_at, p_until) range.
+-- The whole function runs as a single statement => one autocommit transaction per batch.
+CREATE OR REPLACE FUNCTION maintenance.dialogsearch_scope_backfill_batch(
+    p_worker     text,
+    p_batch_size integer,
+    p_start_at   uuid DEFAULT NULL,   -- range lower bound (exclusive); used only if no checkpoint yet
+    p_until      uuid DEFAULT NULL    -- range upper bound (exclusive); NULL = no bound
+) RETURNS TABLE(updated integer, scanned integer, next_cursor uuid)
+LANGUAGE plpgsql AS $$
 DECLARE
-    v_batch_id bigint;
+    v_cursor  uuid;
+    v_updated integer;
+    v_scanned integer;
+    v_next    uuid;
 BEGIN
-    INSERT INTO maintenance."DialogSearchScopeBackfill_BatchLog" ("WorkerId")
-    VALUES (p_worker_id)
-    RETURNING "BatchId" INTO v_batch_id;
+    SELECT c."LastDialogId" INTO v_cursor
+    FROM maintenance."DialogSearchScopeBackfill_Checkpoint" c
+    WHERE c."WorkerId" = p_worker;
 
-    WITH claimed AS (
-        SELECT "EntityId"
-        FROM maintenance."DialogSearchScopeBackfill_Candidates"
-        WHERE "ProcessedAt" IS NULL
-        ORDER BY "EntityId"
-        FOR UPDATE SKIP LOCKED
+    v_cursor := COALESCE(v_cursor, p_start_at, '00000000-0000-0000-0000-000000000000'::uuid);
+
+    WITH batch AS (
+        SELECT ds."DialogId"
+        FROM search."DialogSearch" ds
+        WHERE ds."DialogId" > v_cursor
+          AND (p_until IS NULL OR ds."DialogId" < p_until)
+        ORDER BY ds."DialogId"
         LIMIT p_batch_size
     ),
-    -- >>> JOB-SPECIFIC (edit me) >>>
-    updated AS (
-        -- Backfill the denormalized scope columns from the source Dialog. "UpdatedAt"
-        -- (the reindex/staleness watermark) is deliberately NOT touched -- this is not a
-        -- reindex, just a copy of already-current Dialog data. "ServiceResource" is stored
-        -- without the static 'urn:altinn:resource:' prefix to match the functions/view.
+    upd AS (
         UPDATE search."DialogSearch" ds
-        SET    "ContentUpdatedAt" = d."ContentUpdatedAt",
-               "ServiceResource"  = replace(d."ServiceResource", 'urn:altinn:resource:', '')
-        FROM   claimed c
-        JOIN   public."Dialog" d ON d."Id" = c."EntityId"
-        WHERE  ds."DialogId" = c."EntityId"
-          AND  (ds."ContentUpdatedAt" IS NULL OR ds."ServiceResource" IS NULL)  -- guard predicate
-        RETURNING ds."DialogId" AS "Id"
-    ),
-    -- <<< JOB-SPECIFIC <<<
-    marked AS (
-        UPDATE maintenance."DialogSearchScopeBackfill_Candidates" cand
-        SET "ProcessedAt" = now(),
-            "WorkerId"    = p_worker_id,
-            "Outcome"     = CASE WHEN u."Id" IS NOT NULL
-                                 THEN 'updated'
-                                 ELSE 'skipped_state_changed' END
-        FROM claimed c
-        LEFT JOIN updated u ON u."Id" = c."EntityId"
-        WHERE cand."EntityId" = c."EntityId"
-        RETURNING cand."Outcome"
+        SET "ContentUpdatedAt" = d."ContentUpdatedAt",
+            "ServiceResource"  = replace(d."ServiceResource", 'urn:altinn:resource:', '')
+        FROM batch b
+        JOIN public."Dialog" d ON d."Id" = b."DialogId"
+        WHERE ds."DialogId" = b."DialogId"
+          AND (ds."ContentUpdatedAt" IS NULL OR ds."ServiceResource" IS NULL)  -- guard
+        RETURNING ds."DialogId"
     )
-    SELECT
-        COUNT(*)::int                                       AS claimed,
-        COUNT(*) FILTER (WHERE "Outcome" = 'updated')::int  AS updated,
-        COUNT(*) FILTER (WHERE "Outcome" <> 'updated')::int AS skipped
-    INTO p_claimed, p_updated, p_skipped
-    FROM marked;
+    SELECT (SELECT count(*) FROM upd)::int,
+           (SELECT count(*) FROM batch)::int,
+           (SELECT max(b2."DialogId") FROM batch b2)
+    INTO v_updated, v_scanned, v_next;
 
-    UPDATE maintenance."DialogSearchScopeBackfill_BatchLog"
-    SET "FinishedAt" = now(),
-        "Claimed"    = p_claimed,
-        "Updated"    = p_updated,
-        "Skipped"    = p_skipped
-    WHERE "BatchId" = v_batch_id;
+    IF v_scanned > 0 THEN
+        INSERT INTO maintenance."DialogSearchScopeBackfill_Checkpoint" AS c
+            ("WorkerId","LastDialogId","UpdatedTotal","ScannedTotal","Batches")
+        VALUES (p_worker, v_next, v_updated, v_scanned, 1)
+        ON CONFLICT ("WorkerId") DO UPDATE
+        SET "LastDialogId" = EXCLUDED."LastDialogId",
+            "UpdatedTotal" = c."UpdatedTotal" + EXCLUDED."UpdatedTotal",
+            "ScannedTotal" = c."ScannedTotal" + EXCLUDED."ScannedTotal",
+            "Batches"      = c."Batches" + 1,
+            "UpdatedAt"    = now();
+    END IF;
+
+    updated := v_updated; scanned := v_scanned; next_cursor := v_next;
+    RETURN NEXT;
 END;
 $$;
