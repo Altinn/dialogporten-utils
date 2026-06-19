@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 # =========================================================================
+# ⚠️  THIS SCRIPT IS MOVING — a newer version lives at db-access/forward.sh
+#     (alongside db-login.sh / pg-token.sh for Entra-based DB access).
+#
+#     THIS is the previous, stable version, kept here on purpose: it's the
+#     proven script for general jumper/SSH access. If the newer db-access copy
+#     misbehaves, use this one. Once the new version has settled, this folder
+#     will be removed (target: after the summer, ≈ 2026-08) — please start
+#     migrating any aliases toward db-access/forward.sh.
+# =========================================================================
 # Database Connection Forwarder for Dialogporten
 #
 # Sets up secure SSH tunnels to Azure database resources using a jumper VM.
