@@ -1,12 +1,14 @@
-# database-forwarder — moved to `../db-access/`
+# database-forwarder — superseded by `../db-access/`
 
-This folder has **moved to [`db-access/`](../db-access/)**, which now holds the
+The tooling has moved to [`db-access/`](../db-access/), which holds the newer
 tunnel script (`forward.sh`) plus the Entra login helpers (`db-login.sh`,
 `pg-token.sh`).
 
-`forward.sh` is kept here **temporarily** as a compatibility copy so existing
-aliases/scripts pointing at `database-forwarder/forward.sh` don't break. It is
-identical to `db-access/forward.sh`.
+**This folder keeps the previous, stable `forward.sh` on purpose.** It is the
+proven script for general jumper / SSH access, kept as a fallback in case the
+newer `db-access/forward.sh` (which has had significant recent changes) has any
+issues. If the new one misbehaves, use this one.
 
-**Please update any alias to point at `db-access/forward.sh`.** This folder is
-slated for removal after the summer (≈ 2026-08).
+Once the new version has settled, this folder will be removed (target: after the
+summer, ≈ 2026-08). Please start migrating any aliases toward
+`db-access/forward.sh`.
