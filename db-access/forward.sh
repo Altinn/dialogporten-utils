@@ -78,47 +78,24 @@ log_title() {
     echo -e "\n${BOLD}${CYAN}$1${NC}"
 }
 
-# Print a formatted box with title and content
+# Print a formatted box with title and content (ANSI-aware). Borders are built
+# with a printf loop instead of `tr`, which mangles the multibyte box chars when
+# LANG is unset / C locale; rows are floored at zero padding so long lines (e.g.
+# the connection string) don't produce a ragged box. Mirrors db-login.sh.
 print_box() {
-    local title="$1"
-    local content="$2"
-    local width=70  # Reduced width for better readability
-    local padding=2  # Consistent padding for all lines
-
-    # Function to calculate visible length of string (excluding ANSI codes)
-    get_visible_length() {
-        local str
-        str=$(printf "%b" "$1" | sed 's/\x1b\[[0-9;]*m//g')
-        echo "${#str}"
+    local title="$1" content="$2" width=70 padding=2
+    get_visible_length() { local str; str=$(printf "%b" "$1" | sed 's/\x1b\[[0-9;]*m//g'); echo "${#str}"; }
+    _rule() { local n=$1 i; for ((i=0; i<n; i++)); do printf '─'; done; }
+    _row() { # $1 = content (may contain ANSI); pads to width, never negative
+        local vlen pad; vlen=$(get_visible_length "$1"); pad=$((width - vlen - padding))
+        [ "$pad" -lt 0 ] && pad=0
+        printf "│%-${padding}s%b%*s│\n" " " "$1" "$pad" ""
     }
-
-    # Top border
-    printf "╭%s\n" "$(printf '%*s' "$width" | tr ' ' '─')"
-
-    # Title line with proper padding
-    local title_length=$(get_visible_length "$title")
-    printf "│%-${padding}s%b%*s\n" " " "$title" "$((width - title_length - padding))" ""
-
-    # Empty line
-    printf "│%*s\n" "$width" ""
-
-    # Content (handle multiple lines)
-    while IFS= read -r line; do
-        # Skip empty lines
-        if [ -z "$line" ]; then
-            printf "│%*s\n" "$width" ""
-            continue
-        fi
-
-        # Get the visible length of the line (excluding ANSI codes)
-        local visible_length=$(get_visible_length "$line")
-
-        # Print the line with proper padding
-        printf "│%-${padding}s%b%*s\n" " " "$line" "$((width - visible_length - padding))" ""
-    done <<< "$content"
-
-    # Bottom border
-    printf "╰%s\n" "$(printf '%*s' "$width" | tr ' ' '─')"
+    printf "╭"; _rule "$width"; printf "╮\n"
+    _row "$title"
+    _row ""
+    while IFS= read -r line; do _row "$line"; done <<< "$content"
+    printf "╰"; _rule "$width"; printf "╯\n"
 }
 
 # Convert a string to uppercase
@@ -378,11 +355,12 @@ subscription_logged_in() {
     printf '%s\n' "$AZ_ACCOUNTS" | awk -F'\t' -v s="$sub_name" '$2==s{f=1} END{exit !f}'
 }
 
-# Surface which Dialogporten accounts are logged in (mirrors db-login.sh). Since we
-# scope every call by --subscription and never switch the active account, the active
-# one is irrelevant — what matters is being logged into the account that OWNS the env
-# you target. Showing the landscape up front makes a partial login obvious before the
-# tunnel fails deep in JIT/SSH. Returns 0 if any Dialogporten account is logged in.
+# Surface which Dialogporten accounts are logged in (mirrors db-login.sh). What
+# matters is being logged into the account that OWNS the env you target; main()
+# then switches the active account to that owner before tunneling (the tunnel cert
+# is minted for the active identity). Showing the landscape up front makes a
+# partial login obvious before the tunnel fails. Returns 0 if any Dialogporten
+# account is logged in.
 show_account_landscape() {
     AZ_ACCOUNTS=$(az account list --query "[?state=='Enabled'].[user.name, name]" -o tsv 2>/dev/null || true)
     if [ -z "$AZ_ACCOUNTS" ]; then
@@ -414,29 +392,6 @@ get_subscription_name() {
         "prod")         echo "${SUBSCRIPTION_PREFIX}-Prod"      ;;
         *)              echo ""                                 ;;
     esac
-}
-
-# Get subscription ID for a given environment
-get_subscription_id() {
-    local env=$1
-    local subscription_name
-    subscription_name=$(get_subscription_name "$env")
-
-    if [ -z "$subscription_name" ]; then
-        log_error "Invalid environment: $env"
-        exit 1
-    fi
-
-    local sub_id
-    sub_id=$(az account show --subscription "$subscription_name" --query id -o tsv 2>/dev/null)
-
-    if [ -z "$sub_id" ]; then
-        log_error "Not logged into the account that owns '${subscription_name}' (needed for env '${env}')."
-        log_info  "See the logged-in accounts listed above. Fix with:  az login  (as the owning identity)."
-        exit 1
-    fi
-
-    echo "$sub_id"
 }
 
 # Resource naming helper functions
@@ -513,8 +468,9 @@ configure_jit_access() {
 
     log_success "Public IP detected: $my_ip"
 
-    # Get VM details. Scope every call with --subscription (never `az account set`)
-    # so the right identity is used even when a different account is active.
+    # Get VM details. Scope each az call with --subscription so it targets this
+    # env's subscription explicitly (main() has already set the active account to
+    # the owning identity by this point).
     log_info "Fetching VM details..."
     local vm_id
     vm_id=$(az vm show --subscription "$subscription_id" --resource-group "$resource_group" --name "$vm_name" --query "id" -o tsv)
@@ -769,9 +725,10 @@ setup_ssh_tunnel() {
         return 0   # reused an existing tunnel; nothing more to do
     fi
 
-    # Scope `az ssh vm` with --subscription so the Entra SSH cert is minted as the
-    # identity owning that subscription — works even when a different az account is
-    # active, and never switches the active account.
+    # By this point main() has set the active account to the env's owning identity
+    # (the SSH cert is minted for the ACTIVE identity, and only the owning account
+    # can authenticate to the env's jumper). The --subscription flag keeps the call
+    # scoped to that env's subscription.
     #
     # `-o IdentitiesOnly=yes` is critical: it stops ssh offering every key in your
     # ssh-agent to the jumper. With a busy agent (many keys), ssh burns through the
