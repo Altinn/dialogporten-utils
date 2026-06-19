@@ -30,11 +30,13 @@ readonly VALID_ENVIRONMENTS=("test" "yt01" "staging" "prod")
 # collide on localhost. Scheme: increasing toward prod (prod most distinct).
 # Keep in sync with db-login.sh env_port() and the pgAdmin server configs.
 postgres_local_port() {
+    # Per-env LOCAL bind ports, deliberately in the 25432-55432 range to avoid the
+    # common local-Docker/Podman Postgres port (15432) and the default 5432.
     case "$1" in
-        test)    echo 15432 ;;
-        yt01)    echo 25432 ;;
-        staging) echo 35432 ;;
-        prod)    echo 45432 ;;
+        test)    echo 25432 ;;
+        yt01)    echo 35432 ;;
+        staging) echo 45432 ;;
+        prod)    echo 55432 ;;
         *)       echo "$DEFAULT_POSTGRES_PORT" ;;
     esac
 }
@@ -234,7 +236,7 @@ Options:
 
     -t, --type TYPE       Database type to connect to (${VALID_DB_TYPES[*]})
                           - postgres: PostgreSQL Flexible Server (local port per env:
-                            test=15432, yt01=25432, staging=35432, prod=45432)
+                            test=25432, yt01=35432, staging=45432, prod=55432)
                           - redis:    Redis Cache (default port: $DEFAULT_REDIS_PORT)
 
     -n, --name NAME       Override resource base name for selected type/environment
@@ -255,6 +257,12 @@ Options:
                           and tunnel-only mode. If -n is omitted and multiple servers match,
                           it errors (won't guess between e.g. postgres / postgres2) — pass -n.
                           Good for backgrounding: forward.sh --no-prompt -e staging &
+
+    --kill-stale          If a stale Dialogporten tunnel is already holding the local port,
+                          kill it and start fresh without prompting. (A healthy tunnel to the
+                          SAME server is reused either way; a non-tunnel listener, e.g. Docker,
+                          is never killed.) Without this flag, an interactive run asks first
+                          and a --no-prompt run refuses.
 
     -h, --help           Show this help message
 
@@ -664,6 +672,81 @@ get_redis_info() {
     echo "connection_string=redis://:<retrieve-password-from-keyvault>@${hostname}:${local_port:-$port}"
 }
 
+# Pre-flight a local port before opening a tunnel on it. Tunnel-only (-N) sessions
+# can be left running (terminal closed, machine slept) and silently squat on the
+# port, causing a cryptic "Address already in use" on the next run AND, worse, your
+# DB client connecting through a stale/wrong tunnel. This classifies what (if
+# anything) holds the port and decides what to do.
+#
+# Args: $1=local_port  $2=target_hostname  $3=no_prompt(true/false)  $4=kill_stale(true/false)
+# Returns: 0 = OK to launch a new tunnel; 1 = reuse the existing healthy tunnel
+#          (caller should NOT launch); exits non-zero on an unresolved conflict.
+preflight_port() {
+    local port=$1 target=$2 no_prompt=${3:-false} kill_stale=${4:-false}
+
+    local pids
+    pids=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | sort -u)
+    [ -z "$pids" ] && return 0   # port free -> launch
+
+    # Inspect each holder. An "our tunnel" is an ssh process whose command contains
+    # `-L <port>:<host>:`. Capture whether it targets the SAME host we want.
+    local pid cmd our_same="" our_other="" foreign=""
+    for pid in $pids; do
+        cmd=$(ps -o command= -p "$pid" 2>/dev/null)
+        if printf '%s' "$cmd" | grep -q -- "-L ${port}:.*:"; then
+            if printf '%s' "$cmd" | grep -q -- "-L ${port}:${target}:"; then
+                our_same="$our_same $pid"
+            else
+                our_other="$our_other $pid"
+            fi
+        else
+            foreign="$foreign $pid ($(printf '%s' "$cmd" | awk '{print $1}'))"
+        fi
+    done
+
+    # Case 1: a healthy tunnel to the SAME server already exists -> reuse it.
+    if [ -n "$our_same" ] && [ -z "$our_other" ] && [ -z "$foreign" ]; then
+        log_success "A tunnel to ${BOLD}${target}${NC} is already up on ${BOLD}localhost:${port}${NC} — reusing it."
+        log_info "Stop it with ${BOLD}Ctrl-C${NC} in its terminal, or:  kill${our_same}"
+        return 1   # signal caller to NOT launch a duplicate
+    fi
+
+    # Case 2: a FOREIGN listener (not our ssh tunnel) holds the port (e.g. gvproxy/Docker).
+    # Never kill it — it's not ours.
+    if [ -n "$foreign" ]; then
+        log_error "Port ${port} is held by a non-tunnel process:${foreign}"
+        log_info  "That isn't a Dialogporten tunnel, so it won't be touched. Free it, or pick another port with ${BOLD}-p <port>${NC}."
+        exit 1
+    fi
+
+    # Case 3: stale/other Dialogporten tunnel(s) on this port (wrong host, or duplicates).
+    local stale="${our_same}${our_other}"
+    log_warning "Port ${port} is already held by an existing Dialogporten tunnel (likely stale):${stale}"
+    if [ "$kill_stale" = "true" ]; then
+        log_info "Killing stale tunnel(s) (--kill-stale):${stale}"
+        # shellcheck disable=SC2086
+        kill $stale 2>/dev/null; sleep 1
+        return 0
+    fi
+    if [ "$no_prompt" = "true" ]; then
+        log_error "Refusing to launch over a stale tunnel. Re-run with ${BOLD}--kill-stale${NC}, or stop it:  kill${stale}"
+        exit 1
+    fi
+    # Interactive: offer to kill and continue.
+    local ans
+    read -rp "Kill the stale tunnel(s) and start fresh? [Y/n]: " ans
+    case "${ans:-Y}" in
+        [Yy]*|"")
+            # shellcheck disable=SC2086
+            kill $stale 2>/dev/null; sleep 1
+            log_success "Cleared. Starting a fresh tunnel."
+            return 0 ;;
+        *)
+            log_warning "Left the existing tunnel in place. If it's healthy you can just use localhost:${port}; otherwise stop it and re-run."
+            exit 0 ;;
+    esac
+}
+
 # Set up SSH tunnel to the database.
 # Default (shell_mode=false): -N port-forward only — no remote shell, no Ubuntu
 #   MOTD; the tunnel holds the terminal, press Ctrl-C to stop.
@@ -676,10 +759,26 @@ setup_ssh_tunnel() {
     local local_port=${4:-$remote_port}
     local shell_mode=${5:-false}
     local subscription_id=${6:-}
+    local no_prompt=${7:-false}
+    local kill_stale=${8:-false}
+
+    # Pre-flight the local port: free -> continue; healthy same-host tunnel -> reuse
+    # (don't launch a duplicate); foreign listener -> refuse; stale tunnel -> kill (prompt
+    # or --kill-stale) then continue.
+    if ! preflight_port "$local_port" "$hostname" "$no_prompt" "$kill_stale"; then
+        return 0   # reused an existing tunnel; nothing more to do
+    fi
 
     # Scope `az ssh vm` with --subscription so the Entra SSH cert is minted as the
     # identity owning that subscription — works even when a different az account is
     # active, and never switches the active account.
+    #
+    # `-o IdentitiesOnly=yes` is critical: it stops ssh offering every key in your
+    # ssh-agent to the jumper. With a busy agent (many keys), ssh burns through the
+    # jumper's MaxAuthTries (~6) before reaching the Entra cert az just minted, and
+    # the jumper drops you with "Too many authentication failures". This forces ssh
+    # to use ONLY the az-provided cert.
+    local ssh_opts=(-o IdentitiesOnly=yes)
     log_info "Connecting to ${hostname}:${remote_port} via local port ${local_port}"
     if [ "$shell_mode" = "true" ]; then
         log_info "Interactive jumper shell; type ${BOLD}exit${NC} to close the tunnel."
@@ -687,14 +786,14 @@ setup_ssh_tunnel() {
             --subscription "$subscription_id" \
             -g "$(get_resource_group "$env")" \
             -n "$(get_jumper_vm_name "$env")" \
-            -- -tt -L "${local_port}:${hostname}:${remote_port}"
+            -- "${ssh_opts[@]}" -tt -L "${local_port}:${hostname}:${remote_port}"
     else
         log_success "Tunnel up on ${BOLD}localhost:${local_port}${NC} — press ${BOLD}Ctrl-C${NC} to stop."
         az ssh vm \
             --subscription "$subscription_id" \
             -g "$(get_resource_group "$env")" \
             -n "$(get_jumper_vm_name "$env")" \
-            -- -N -L "${local_port}:${hostname}:${remote_port}"
+            -- "${ssh_opts[@]}" -N -L "${local_port}:${hostname}:${remote_port}"
     fi
 }
 
@@ -729,6 +828,7 @@ main() {
     local name_override=${4:-}
     local shell_mode=${5:-false}
     local no_prompt=${6:-false}
+    local kill_stale=${7:-false}
 
     # Add trap to handle script termination
     trap 'echo -e "\n${YELLOW}⚠${NC} Operation interrupted"; exit 130' INT TERM
@@ -902,7 +1002,7 @@ ${BOLD}${connection_string/localhost/$'\n'localhost}${NC}"
     fi
 
     # Set up the SSH tunnel
-    setup_ssh_tunnel "$environment" "${hostname}" "${port}" "${local_port:-$port}" "${shell_mode}" "${subscription_id}"
+    setup_ssh_tunnel "$environment" "${hostname}" "${port}" "${local_port:-$port}" "${shell_mode}" "${subscription_id}" "${no_prompt}" "${kill_stale}"
 }
 
 # =========================================================================
@@ -916,6 +1016,7 @@ local_port=""
 name_override=""
 shell_mode="false"   # default: port-forward only (-N), no jumper shell / no MOTD
 no_prompt="false"    # --no-prompt: never prompt; use flags + defaults, else fail
+kill_stale="false"   # --kill-stale: if a stale tunnel holds the port, kill it (no prompt)
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -948,6 +1049,10 @@ while [[ $# -gt 0 ]]; do
             no_prompt="true"
             shift
             ;;
+        --kill-stale)
+            kill_stale="true"
+            shift
+            ;;
         -h|--help)
             print_help
             exit 0
@@ -965,4 +1070,4 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Call main with all arguments
-main "${environment:-}" "${db_type:-}" "${local_port:-}" "${name_override:-}" "${shell_mode}" "${no_prompt}"
+main "${environment:-}" "${db_type:-}" "${local_port:-}" "${name_override:-}" "${shell_mode}" "${no_prompt}" "${kill_stale}"

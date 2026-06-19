@@ -82,10 +82,10 @@ subscription_logged_in() {
 # Scheme: increasing toward prod (prod on the highest, most-distinct port).
 env_port() {
   case "$1" in
-    test)    echo 15432 ;;
-    yt01)    echo 25432 ;;
-    staging) echo 35432 ;;
-    prod)    echo 45432 ;;
+    test)    echo 25432 ;;
+    yt01)    echo 35432 ;;
+    staging) echo 45432 ;;
+    prod)    echo 55432 ;;
     *)       echo "" ;;
   esac
 }
