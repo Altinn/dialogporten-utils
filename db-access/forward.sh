@@ -746,25 +746,33 @@ setup_ssh_tunnel() {
             -- "${ssh_opts[@]}" -tt -L "${local_port}:${hostname}:${remote_port}"
     else
         # `az ssh vm -N` holds the terminal once the tunnel is up, so we can't print
-        # "tunnel up" after it. But printing before it is a lie: az still has to log in,
-        # request the cert and authenticate to the jumper before the local port binds
-        # (often 10-30s), and a client that connects in that window gets "Connection
-        # refused". So announce that we're establishing, then background a waiter that
-        # prints the real "up" line only once the local port is actually LISTENING
-        # (same lsof check preflight_port uses). The waiter exits on its own.
-        log_info "Establishing tunnel to ${hostname}:${remote_port} on ${BOLD}localhost:${local_port}${NC} (Azure login + JIT cert can take ~10-30s)..."
+        # "tunnel up" after it; and printing it *before* is a lie, because az still has to
+        # log in, mint the cert and authenticate to the jumper before the local port binds
+        # (cold JIT can take a minute or more), and a client that connects in that window
+        # gets "Connection refused".
+        #
+        # So: keep az ssh in the FOREGROUND (so terminal Ctrl-C kills az's whole process
+        # tree exactly as it always has — az spawns python -> ssh, and backgrounding it
+        # would orphan those), and run only a small background waiter that prints the real
+        # "up" line the moment the local port actually LISTENs (same lsof check
+        # preflight_port uses). The RETURN trap reaps the waiter when az ssh exits —
+        # whether the tunnel was closed with Ctrl-C or az failed to establish it (in which
+        # case az's own error is printed above and the function simply returns).
+        log_info "Establishing tunnel to ${hostname}:${remote_port} on ${BOLD}localhost:${local_port}${NC} (Azure login + JIT cert can take a minute or more)..."
         (
-            for _ in $(seq 1 120); do
+            local waited=0
+            while :; do
                 if [ -n "$(lsof -nP -iTCP:"$local_port" -sTCP:LISTEN -t 2>/dev/null)" ]; then
                     log_success "Tunnel up on ${BOLD}localhost:${local_port}${NC} — press ${BOLD}Ctrl-C${NC} to stop."
-                    exit 0
+                    break
                 fi
-                sleep 0.5
+                sleep 1; waited=$((waited + 1))
+                # Gentle reassurance so a slow establishment doesn't look hung.
+                [ $((waited % 20)) -eq 0 ] && log_info "Still establishing the tunnel (${waited}s)... this is normal for a cold JIT start."
             done
-            log_warning "Local port ${local_port} still not listening after 60s — check for errors above; the tunnel may have failed."
         ) &
         local waiter_pid=$!
-        # Don't leave the waiter running if the tunnel command returns/cancels first.
+        # Reap the waiter when we leave this function (az ssh returned: Ctrl-C or failure).
         trap 'kill "$waiter_pid" 2>/dev/null' RETURN
         az ssh vm \
             --subscription "$subscription_id" \
