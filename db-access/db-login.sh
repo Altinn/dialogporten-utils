@@ -288,8 +288,10 @@ Usage: $0 [-e ENV] [-t TIER] [-c CLIENT]
   -t, --tier        ${VALID_TIERS[*]}   (read=SELECT, write=DML, migrator=DDL)
   -c, --client      token | psql   (default: prompt; 'token' = copy a token to paste into
                     pgAdmin/Rider/etc. Old values pgadmin|rider|raw are accepted as 'token'.)
-  --export-pgadmin  Emit a pgAdmin Import/Export servers JSON to stdout (all envs/tiers,
-                    per-env groups, token exec command wired to this machine). No prompts.
+  --export-pgadmin  Generate the pgAdmin servers (all envs/tiers, per-env groups, token
+                    exec command wired to this machine). No prompts. At a terminal it writes
+                    the servers file and copies a ready-to-run import command to your
+                    clipboard; when piped/redirected (e.g. > servers.json) it emits raw JSON.
                     Recommended for pgAdmin users: import once, then pgAdmin auto-refreshes
                     the token. (Interactive equivalent: the last client menu option.)
   --no-migrator     With --export-pgadmin: omit the migrator/DDL tier servers.
@@ -321,9 +323,17 @@ main() {
     esac
   done
 
-  # Generator mode: emit servers.json to stdout and exit (no prompts, no az needed).
+  # Generator mode (no prompts, no az needed). When stdout is a terminal, run the
+  # friendly flow: write the servers file and copy a ready-to-run import command to
+  # the clipboard (same as the interactive menu option). When stdout is piped or
+  # redirected (e.g. `--export-pgadmin > servers.json`), emit raw JSON so that use
+  # keeps working.
   if [ "$export_mode" = "yes" ]; then
-    export_pgadmin "$include_migrator"
+    if [ -t 1 ]; then
+      interactive_export_pgadmin "$include_migrator"
+    else
+      export_pgadmin "$include_migrator"
+    fi
     exit 0
   fi
 
