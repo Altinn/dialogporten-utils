@@ -745,7 +745,27 @@ setup_ssh_tunnel() {
             -n "$(get_jumper_vm_name "$env")" \
             -- "${ssh_opts[@]}" -tt -L "${local_port}:${hostname}:${remote_port}"
     else
-        log_success "Tunnel up on ${BOLD}localhost:${local_port}${NC} — press ${BOLD}Ctrl-C${NC} to stop."
+        # `az ssh vm -N` holds the terminal once the tunnel is up, so we can't print
+        # "tunnel up" after it. But printing before it is a lie: az still has to log in,
+        # request the cert and authenticate to the jumper before the local port binds
+        # (often 10-30s), and a client that connects in that window gets "Connection
+        # refused". So announce that we're establishing, then background a waiter that
+        # prints the real "up" line only once the local port is actually LISTENING
+        # (same lsof check preflight_port uses). The waiter exits on its own.
+        log_info "Establishing tunnel to ${hostname}:${remote_port} on ${BOLD}localhost:${local_port}${NC} (Azure login + JIT cert can take ~10-30s)..."
+        (
+            for _ in $(seq 1 120); do
+                if [ -n "$(lsof -nP -iTCP:"$local_port" -sTCP:LISTEN -t 2>/dev/null)" ]; then
+                    log_success "Tunnel up on ${BOLD}localhost:${local_port}${NC} — press ${BOLD}Ctrl-C${NC} to stop."
+                    exit 0
+                fi
+                sleep 0.5
+            done
+            log_warning "Local port ${local_port} still not listening after 60s — check for errors above; the tunnel may have failed."
+        ) &
+        local waiter_pid=$!
+        # Don't leave the waiter running if the tunnel command returns/cancels first.
+        trap 'kill "$waiter_pid" 2>/dev/null' RETURN
         az ssh vm \
             --subscription "$subscription_id" \
             -g "$(get_resource_group "$env")" \
