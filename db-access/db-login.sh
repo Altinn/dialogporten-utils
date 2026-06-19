@@ -259,6 +259,17 @@ validate_in() { # $1=value $2..=valid set ; returns 0 if member
   return 1
 }
 
+# Ensure a value-taking flag actually got a value before `shift 2`. Without this,
+# a trailing flag (e.g. `db-login.sh -e`) leaves $2 empty and `shift 2` fails on a
+# one-element arg list; with no `set -e`, the while loop then spins forever. A
+# value starting with `-` is rejected too (it's the next flag, not a value).
+require_value() { # $1=flag name, $2=value
+  if [ -z "${2:-}" ] || [[ "${2:-}" == -* ]]; then
+    log_error "Option $1 requires a value."
+    exit 1
+  fi
+}
+
 # =========================================================================
 # Help
 # =========================================================================
@@ -300,9 +311,9 @@ main() {
   local environment="" tier="" client="" export_mode="" include_migrator="yes"
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -e|--env)         environment="${2:-}"; shift 2 ;;
-      -t|--tier)        tier="${2:-}"; shift 2 ;;
-      -c|--client)      client="${2:-}"; shift 2 ;;
+      -e|--env)         require_value "$1" "${2:-}"; environment="$2"; shift 2 ;;
+      -t|--tier)        require_value "$1" "${2:-}"; tier="$2"; shift 2 ;;
+      -c|--client)      require_value "$1" "${2:-}"; client="$2"; shift 2 ;;
       --export-pgadmin) export_mode="yes"; shift ;;
       --no-migrator)    include_migrator="no"; shift ;;
       -h|--help)        print_help; exit 0 ;;
