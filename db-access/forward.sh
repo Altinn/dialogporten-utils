@@ -909,17 +909,45 @@ main() {
         validate_port "$local_port" || exit 1
     fi
 
-    # Resolve the env's subscription. We do NOT `az account set` — every az call
-    # below is scoped with --subscription instead, so the right identity is used
-    # without switching the active account (matches db-login.sh / pg-token.sh).
-    # (get_subscription_id already errored out above if the owning account isn't
-    # logged in, so by here the identity resolves.)
+    # Ensure the ACTIVE az account owns this env's subscription, switching if needed.
+    # Unlike token fetching (db-login.sh, which is --subscription-scoped and never
+    # switches), the SSH tunnel below mints a cert for the ACTIVE identity — and only
+    # the identity that owns the env's subscription can authenticate to its jumper.
+    # So here a switch is genuinely required when the env is owned by a different
+    # logged-in account (e.g. test/yt01 -> ext-khaug, staging/prod -> ext-khaug-prod).
+    local sub_name; sub_name=$(get_subscription_name "$environment")
+    # Find which logged-in account (if any) owns this subscription, and the active one.
+    local owner active_user active_sub
+    owner=$(az account list --query "[?name=='${sub_name}' && state=='Enabled'].user.name | [0]" -o tsv 2>/dev/null)
+    active_user=$(az account show --query user.name -o tsv 2>/dev/null || true)
+    active_sub=$(az account show --query name -o tsv 2>/dev/null || true)
+
+    if [ -z "$owner" ]; then
+        log_error "Not logged into any account that has '${sub_name}' (needed for ${BOLD}$(env_label "$environment")${NC})."
+        log_info  "Run:  az login  as the identity that owns it, then retry."
+        exit 1
+    fi
+
+    if [ "$active_sub" = "$sub_name" ]; then
+        log_success "Active account ${BOLD}${active_user}${NC} already targets ${sub_name} for ${BOLD}$(env_label "$environment")${NC}."
+    else
+        # The switch is required (the tunnel cert is bound to the active identity, and
+        # only the env's owning account can authenticate to its jumper) and benign
+        # (az account set is trivially reversible). So we don't prompt — but we DO
+        # announce it loudly, since changing the active account affects other terminals.
+        log_warning "Switching active az account to ${BOLD}${owner}${NC} (subscription ${sub_name}) for ${BOLD}$(env_label "$environment")${NC}."
+        log_info  "  (the tunnel needs the env's owning identity active; this also changes it for other terminals)"
+        if az account set --subscription "$sub_name" >/dev/null 2>&1; then
+            active_user=$(az account show --query user.name -o tsv 2>/dev/null)
+            log_success "Active account is now ${BOLD}${active_user}${NC}."
+        else
+            log_error "Failed to switch to ${sub_name}. Try:  az account set --subscription \"${sub_name}\""
+            exit 1
+        fi
+    fi
+
     local subscription_id
-    subscription_id=$(get_subscription_id "$environment")
-    local sub_identity
-    sub_identity=$(az account show --subscription "$subscription_id" --query user.name -o tsv 2>/dev/null || true)
-    [ -n "$sub_identity" ] && \
-        log_success "Using ${BOLD}${sub_identity}${NC} for ${BOLD}$(env_label "$environment")${NC} (no account switch)"
+    subscription_id=$(az account show --query id -o tsv 2>/dev/null)
 
     # Discover/select server if no explicit name was given
     if [ -z "$name_override" ]; then
