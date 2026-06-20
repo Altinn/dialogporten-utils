@@ -37,13 +37,29 @@ WHERE a."Discriminator" <> 'DialogActivityPerformedByActor'
    OR a."ActorTypeId"   <> 1
    OR a."ActorNameEntityId" IS NULL;
 
--- 3c. The target ActorName actually carries the CSV-asserted urn (sanity that
---     resolution pointed at a row for the right person).
+-- 3c. The target ActorName must be in a RECOGNISED Dialogporten actor scheme.
+--     Org performers must be organization:identifier-no -- NOT the legacy
+--     organizationnumber scheme (00a normalises it; the remediation script fixes
+--     any earlier run). A hit here means a foreign-scheme row slipped through.
 \echo ''
-\echo '3c. updated candidates whose target ActorName urn is not a person identifier (expect 0):'
-SELECT COUNT(*) AS target_not_person
+\echo '3c. updated candidates whose target ActorName urn is an unrecognised scheme (expect 0):'
+SELECT COUNT(*) AS target_unexpected_scheme
 FROM maintenance."Iss1712DpcleanupActors_Candidates" c
 JOIN public."ActorName" an ON an."Id" = c."TargetActorNameEntityId"
 WHERE c."Outcome" = 'updated'
-  AND an."ActorId" NOT LIKE 'urn:altinn:person:%';
+  AND an."ActorId" NOT LIKE 'urn:altinn:person:identifier-no:%'
+  AND an."ActorId" NOT LIKE 'urn:altinn:organization:identifier-no:%'
+  AND an."ActorId" NOT LIKE 'urn:altinn:systemuser:uuid:%'
+  AND an."ActorId" NOT LIKE 'urn:altinn:person:idporten-email%'
+  AND an."ActorId" NOT LIKE 'urn:altinn:person:legacy-selfidentified%';
+
+-- 3d. Informational: person vs organization performer split (not an assertion).
+\echo ''
+\echo '3d. (info) updated performer scheme breakdown:'
+SELECT split_part(an."ActorId", ':', 3) AS scheme, COUNT(*) AS updated
+FROM maintenance."Iss1712DpcleanupActors_Candidates" c
+JOIN public."ActorName" an ON an."Id" = c."TargetActorNameEntityId"
+WHERE c."Outcome" = 'updated'
+GROUP BY 1
+ORDER BY updated DESC;
 -- <<< JOB-SPECIFIC <<<

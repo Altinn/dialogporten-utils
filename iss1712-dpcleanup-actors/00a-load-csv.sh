@@ -64,6 +64,15 @@ for p in "${CSV_PATHS[@]}"; do
     psql_run -c "\copy ${STG} ${COLS} FROM STDIN WITH (FORMAT csv, HEADER true)" < "${p}"
 done
 
+# Normalize legacy organization urns to Dialogporten's canonical scheme. The CSV
+# carries org performers as Correspondence's urn:altinn:organizationnumber:<orgno>,
+# but Dialogporten only knows urn:altinn:organization:identifier-no:<orgno>
+# (NorwegianOrganizationIdentifier.Prefix). Rewriting here -- before resolution --
+# means orgs match existing ActorName rows and we never create rows in a foreign
+# scheme. (Persons already arrive as urn:altinn:person:identifier-no, unchanged.)
+echo "Normalizing legacy organizationnumber urns -> organization:identifier-no"
+psql_run -c "UPDATE ${STG} SET \"actor_id\" = 'urn:altinn:organization:identifier-no:' || split_part(\"actor_id\", ':', 4) WHERE \"actor_id\" LIKE 'urn:altinn:organizationnumber:%';"
+
 # Helper index for the candidate-build (01) chunked range scans and the resolution
 # (00b) joins. Built AFTER the load so the bulk COPY isn't slowed by index
 # maintenance. NB: no (actor_id, actor_name) index -- resolution scans staging once
