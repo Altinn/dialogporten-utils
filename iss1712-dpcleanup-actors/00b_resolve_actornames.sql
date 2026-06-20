@@ -63,14 +63,20 @@ WHERE an."ActorId" = r."actor_id"
 -- (actor, name): names change over time and the CSV carries the name as of the
 -- event, so the row reflects when that name was in use -- not now(). UUIDv7 id like
 -- the app; the unique (ActorId, Name) index dedupes against concurrent inserts.
+-- The earliest event timestamp per (actor, name) is computed ONCE here with a
+-- single grouped pass over staging (same cost as the DISTINCT above) -- NOT with a
+-- per-row correlated lookup, which at ISS-1951 scale (no (actor_id,name) staging
+-- index) would seq-scan ~140M rows per inserted actor.
+WITH actor_min_ts AS (
+    SELECT "actor_id", "actor_name", min("source_ts") AS min_ts
+    FROM maintenance."Iss1712DpcleanupActors_Staging"
+    GROUP BY "actor_id", "actor_name"
+)
 INSERT INTO public."ActorName" ("Id", "ActorId", "Name", "CreatedAt")
-SELECT uuidv7(), r."actor_id", r."name", COALESCE(ts.min_ts, now())
+SELECT uuidv7(), r."actor_id", r."name", COALESCE(amt.min_ts, now())
 FROM maintenance."Iss1712DpcleanupActors_ActorNames" r
-JOIN LATERAL (
-    SELECT min(s."source_ts") AS min_ts
-    FROM maintenance."Iss1712DpcleanupActors_Staging" s
-    WHERE s."actor_id" = r."actor_id" AND s."actor_name" = r."name"
-) ts ON true
+JOIN actor_min_ts amt
+  ON amt."actor_id" = r."actor_id" AND amt."actor_name" = r."name"
 WHERE r."actor_name_entity_id" IS NULL
   AND ( r."actor_id" LIKE 'urn:altinn:person:identifier-no:%'
      OR r."actor_id" LIKE 'urn:altinn:organization:identifier-no:%'
