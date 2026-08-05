@@ -22,17 +22,18 @@ export AZURE_CORE_COLLECT_TELEMETRY=false
 export AZURE_CORE_ONLY_SHOW_ERRORS=true
 
 # =========================================================================
-# Configuration  ── EDIT HERE when swapping to the real altinn-platform#3407
-#                   groups, or when port / path conventions change.
+# Configuration  ── the Entra group names live in group_for() below (single swap
+#                   point); edit there or the ports if conventions change.
 # =========================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PG_TOKEN_SCRIPT="${SCRIPT_DIR}/pg-token.sh"
 readonly DB_NAME="dialogporten"
 
-# How to activate write/migrator access via Entra PIM. Read is standing membership
-# (no PIM); write/migrator are PIM-eligible and activated on demand.
-# TODO: replace with the canonical org PIM activation URL / az command.
-readonly PIM_ACTIVATION_HINT="Activate it in Entra PIM (Privileged Identity Management → Groups)."
+# How to activate access via Entra PIM. Only test:read is standing membership;
+# every other env:tier is PIM-eligible. Note the portal path: it's under
+# "Groups", NOT "Microsoft Entra roles" (that tab lists directory roles and will
+# look empty, which is a common wrong turn).
+readonly PIM_ACTIVATION_HINT="Activate it in Entra PIM: portal → Privileged Identity Management → My roles → Groups (NOT 'Microsoft Entra roles') → Eligible assignments → Activate."
 
 # Canonical env values (match forward.sh). yt01 = perf, lives in the test
 # subscription; low focus for now but included for completeness.
@@ -91,30 +92,28 @@ env_port() {
 }
 
 # env:tier -> Entra group name (the PG username you log in as).
-# staging currently REUSES the prod groups. This function is the SINGLE swap point.
+# staging REUSES the prod groups. This function is the SINGLE swap point.
 #
-# SWAP POINT (altinn-platform#3407): the canonical groups these temp groups map to are
-#   read     -> "Altinn Product Dialogporten: PostgreSQL Readonly <Test|Prod>"
-#   write    -> "Altinn Product Dialogporten: PostgreSQL Readwrite <Test|Prod>"
-#   migrator -> "Altinn Product Dialogporten: PostgreSQL Migrator <Test|Prod>"
-# (test/yt01 -> Test groups; staging/prod -> Prod groups). They don't exist as PG roles
-# yet, so the values below are the TEMP groups. Replace each string when #3407 lands.
+# Canonical altinn-platform#3407 groups (landed 2026-06-23). Platform named them
+# lowercase-hyphenated: altinn-dialogporten-<test|prod>-postgresql-<readonly|readwrite|migrator>.
+# (test/yt01 -> test groups; staging/prod -> prod groups.)
+# Only test:read is standing membership. Every other env:tier is PIM-eligible and must be
+# activated (prod/staging read = auto-approve; prod/staging write+migrator = need approval).
 group_for() {
   case "$1:$2" in
-    test:read)        echo "Altinn Product Dialogporten: Developers Dev" ;;
-    test:write)       echo "Dialogporten-Test-Operations" ;;
-    test:migrator)    echo "Dialogporten-Test-UserAdmins" ;;
-    # yt01 (perf) shares the test subscription and reuses the TEST groups,
-    # both now and after #3407 lands.
-    yt01:read)        echo "Altinn Product Dialogporten: Developers Dev" ;;
-    yt01:write)       echo "Dialogporten-Test-Operations" ;;
-    yt01:migrator)    echo "Dialogporten-Test-UserAdmins" ;;
-    staging:read)     echo "Altinn Product Dialogporten: Developers Prod" ;;
-    staging:write)    echo "Dialogporten-Prod-Operations" ;;
-    staging:migrator) echo "Altinn Product Dialogporten: Admins Prod" ;;
-    prod:read)        echo "Altinn Product Dialogporten: Developers Prod" ;;
-    prod:write)       echo "Dialogporten-Prod-Operations" ;;
-    prod:migrator)    echo "Altinn Product Dialogporten: Admins Prod" ;;
+    test:read)        echo "altinn-dialogporten-test-postgresql-readonly" ;;
+    test:write)       echo "altinn-dialogporten-test-postgresql-readwrite" ;;
+    test:migrator)    echo "altinn-dialogporten-test-postgresql-migrator" ;;
+    # yt01 (perf) shares the test subscription and reuses the TEST groups.
+    yt01:read)        echo "altinn-dialogporten-test-postgresql-readonly" ;;
+    yt01:write)       echo "altinn-dialogporten-test-postgresql-readwrite" ;;
+    yt01:migrator)    echo "altinn-dialogporten-test-postgresql-migrator" ;;
+    staging:read)     echo "altinn-dialogporten-prod-postgresql-readonly" ;;
+    staging:write)    echo "altinn-dialogporten-prod-postgresql-readwrite" ;;
+    staging:migrator) echo "altinn-dialogporten-prod-postgresql-migrator" ;;
+    prod:read)        echo "altinn-dialogporten-prod-postgresql-readonly" ;;
+    prod:write)       echo "altinn-dialogporten-prod-postgresql-readwrite" ;;
+    prod:migrator)    echo "altinn-dialogporten-prod-postgresql-migrator" ;;
     *)                echo "" ;;
   esac
 }
@@ -460,17 +459,24 @@ main() {
     if [ "$is_member" = "false" ]; then
       log_error "Identity '${me}' is NOT currently in group '${group}'."
       # A bare 'false' has several causes the check can't distinguish; list the
-      # realistic ones per tier. read = standing membership (no PIM);
-      # write/migrator = PIM-eligible, activated on demand.
-      if [ "$tier" = "read" ]; then
-        log_info  "Read access is standing membership. Likely causes:"
+      # realistic ones. Only test:read is STANDING membership — every other
+      # env:tier is PIM-eligible and must be activated on demand (prod read is
+      # auto-approve; prod write/migrator additionally require approval).
+      if [ "$environment" = "test" ] && [ "$tier" = "read" ]; then
+        log_info  "Test read access is standing membership. Likely causes:"
         log_info  "  • You haven't been granted read access yet → ask to be added to the group."
         log_info  "  • You're not logged into the right account for this env → ${BOLD}az login${NC} as ${me}."
       else
-        log_info  "${BOLD}${tier}${NC} access is granted on demand via PIM. Likely causes:"
+        log_info  "${BOLD}${environment} ${tier}${NC} access is granted on demand via PIM. Likely causes:"
         log_info  "  • You're eligible but haven't activated yet (or it expired) → ${PIM_ACTIVATION_HINT}"
         log_info  "  • You may not be eligible for this role at all → request ${tier} access if you need it."
         log_info  "  • Already activated? Make sure you're logged in as ${BOLD}${me}${NC} (az login)."
+        case "${environment}:${tier}" in
+          prod:write|prod:migrator|staging:write|staging:migrator)
+            log_info  "  • ${BOLD}${environment} ${tier} needs APPROVAL${NC} — an approver must accept your request."
+            log_info  "    Notification e-mail is not working yet, so ping an approver directly."
+            ;;
+        esac
       fi
       exit 1
     elif [ "$is_member" = "true" ]; then
