@@ -755,9 +755,8 @@ setup_ssh_tunnel() {
         # tree exactly as it always has — az spawns python -> ssh, and backgrounding it
         # would orphan those), and run only a small background waiter that prints the real
         # "up" line the moment the local port actually LISTENs (same lsof check
-        # preflight_port uses). The RETURN trap reaps the waiter when az ssh exits —
-        # whether the tunnel was closed with Ctrl-C or az failed to establish it (in which
-        # case az's own error is printed above and the function simply returns).
+        # preflight_port uses). See below for how the waiter is reaped, including when
+        # az ssh fails outright.
         log_info "Establishing tunnel to ${hostname}:${remote_port} on ${BOLD}localhost:${local_port}${NC} (Azure login + JIT cert can take a minute or more)..."
         (
             local waited=0
@@ -772,13 +771,33 @@ setup_ssh_tunnel() {
             done
         ) &
         local waiter_pid=$!
-        # Reap the waiter when we leave this function (az ssh returned: Ctrl-C or failure).
+        # Reap the waiter however we leave this function. A RETURN trap alone is not
+        # enough: with `set -e`, a non-zero exit from az ssh aborts the shell without
+        # running RETURN, which used to leave the waiter orphaned — still printing
+        # "Still establishing the tunnel..." after az had already failed and the user
+        # was back at their prompt. So capture az's status explicitly (`|| rc=$?`,
+        # which also shields it from `set -e`) and kill the waiter ourselves.
         trap 'kill "$waiter_pid" 2>/dev/null' RETURN
+        local rc=0
         az ssh vm \
             --subscription "$subscription_id" \
             -g "$(get_resource_group "$env")" \
             -n "$(get_jumper_vm_name "$env")" \
-            -- "${ssh_opts[@]}" -N -L "${local_port}:${hostname}:${remote_port}"
+            -- "${ssh_opts[@]}" -N -L "${local_port}:${hostname}:${remote_port}" || rc=$?
+        kill "$waiter_pid" 2>/dev/null || true
+        # `|| true` matters: wait on a killed child reports the signal (143), which
+        # would abort the script under `set -e` before we get to check az's status.
+        wait "$waiter_pid" 2>/dev/null || true
+
+        # rc 0 = tunnel closed normally; 130/143 = Ctrl-C or TERM, also normal. Anything
+        # else means az ssh failed, and the port never came up: say so, because the
+        # waiter's last message otherwise implies it is still on its way.
+        if [ "$rc" -ne 0 ] && [ "$rc" -ne 130 ] && [ "$rc" -ne 143 ]; then
+            log_error "Tunnel failed to start (az ssh exited with ${rc}); see the error above."
+            log_info  "If that is a Python or module error from the Azure CLI, the ssh extension is likely broken. Try:"
+            log_info  "    ${BOLD}az extension remove --name ssh && az extension add --name ssh${NC}"
+            return "$rc"
+        fi
     fi
 }
 
