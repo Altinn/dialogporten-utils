@@ -25,6 +25,9 @@ readonly PRODUCT_TAG="Dialogporten"
 readonly DEFAULT_POSTGRES_PORT=5432   # remote port on the server (do not change)
 readonly DEFAULT_REDIS_PORT=6380
 readonly VALID_ENVIRONMENTS=("test" "yt01" "staging" "prod")
+# Entra PIM group-activation blade. Tenant-wide, so the same link works for every
+# environment. Printed with the postgres connection info as a reminder.
+readonly PIM_ACTIVATION_URL="https://portal.azure.com/#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade/~/aadgroup"
 
 # Per-env LOCAL bind port for postgres, so tunnels to multiple envs don't
 # collide on localhost. Scheme: increasing toward prod (prod most distinct).
@@ -1025,12 +1028,22 @@ ${BOLD}${connection_string/localhost/$'\n'localhost}${NC}"
 
     # For postgres, point the dev at the token helper (a sibling script, run
     # locally in a separate terminal). Print the resolved absolute path.
+    #
+    # Also remind them about PIM here. The reminder belongs in this script even
+    # though activation is a database concern rather than a tunnel one: pgAdmin
+    # users set db-login.sh up once and then never run it again, so a hint living
+    # there is seen once and never at the moment it is needed. forward.sh is the
+    # script people run every time. The URL is tenant-wide, so it is the same
+    # link for every environment.
     if [ "$db_type" = "postgres" ]; then
         local login_script
         login_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/db-login.sh"
         echo
         echo -e "${YELLOW}➜ Next: in a new terminal, run db-login.sh for a DB token (pgAdmin/psql/Rider):${NC}"
         echo -e "    ${BOLD}${login_script}${NC}"
+        echo
+        echo -e "${YELLOW}➜ Remember to activate access in PIM first (all tiers except test read):${NC}"
+        echo -e "    ${BOLD}${PIM_ACTIVATION_URL}${NC}"
     fi
 
     # Set up the SSH tunnel
