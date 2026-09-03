@@ -18,7 +18,7 @@
 #     dialog EXCEPT migrated correspondence (*-migratedcorrespondence-*), whose
 #     Id carries the migration time, not the backdated CreatedAt; the report
 #     lists those separately.
-#   Month boundaries are UTC midnight in both modes.
+#   Month boundaries are local midnight in Europe/Oslo (override with TZ_NAME) in both modes.
 #
 #   The range is walked in chunks, one psql statement per chunk, each under a
 #   15 s statement_timeout. A chunk that times out is split in half and
@@ -60,8 +60,9 @@ env_group() {
     esac
 }
 
-to_ms() { python3 -c "import datetime,sys; d=datetime.datetime.fromisoformat(sys.argv[1]).replace(tzinfo=datetime.timezone.utc); print(int(d.timestamp()*1000))" "$1"; }
-fmt_ms() { python3 -c "import datetime,sys; print(datetime.datetime.fromtimestamp(int(sys.argv[1])/1000, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M'))" "$1"; }
+TZ_NAME="${TZ_NAME:-Europe/Oslo}"      # month boundaries are local midnight in this zone
+to_ms() { python3 -c "import datetime,sys,zoneinfo; d=datetime.datetime.fromisoformat(sys.argv[1]).replace(tzinfo=zoneinfo.ZoneInfo(sys.argv[2])); print(int(d.timestamp()*1000))" "$1" "$TZ_NAME"; }
+fmt_ms() { python3 -c "import datetime,sys,zoneinfo; print(datetime.datetime.fromtimestamp(int(sys.argv[1])/1000, zoneinfo.ZoneInfo(sys.argv[2])).strftime('%Y-%m-%d %H:%M'))" "$1" "$TZ_NAME"; }
 
 # ---------------------------------------------------------------- report ---
 if [[ "${1:-}" == "report" ]]; then
@@ -87,6 +88,11 @@ CREATE TABLE cov(org TEXT, from_ms INTEGER, to_ms INTEGER, seconds REAL);
 SQL
     fi
     echo "Coverage: $(sqlite3 "$DB" "SELECT count(*) || ' chunks, ' || coalesce(round(sum(seconds)),0) || ' s total, longest ' || coalesce(round(max(seconds),1),0) || ' s' FROM cov")"
+    OVERLAP=$(sqlite3 "$DB" "SELECT count(*) FROM cov a JOIN cov b ON a.org=b.org AND a.rowid<b.rowid AND a.from_ms<b.to_ms AND b.from_ms<a.to_ms")
+    if [[ "$OVERLAP" != "0" ]]; then
+        echo "ERROR: $OVERLAP overlapping chunk pair(s) in coverage; some intervals were counted twice. Delete OUTDIR and rerun."
+        sqlite3 -column "$DB" "SELECT a.org, datetime(a.from_ms/1000,'unixepoch') a_from, datetime(a.to_ms/1000,'unixepoch') a_to, datetime(b.from_ms/1000,'unixepoch') b_from, datetime(b.to_ms/1000,'unixepoch') b_to FROM cov a JOIN cov b ON a.org=b.org AND a.rowid<b.rowid AND a.from_ms<b.to_ms AND b.from_ms<a.to_ms LIMIT 10"
+    fi
     sqlite3 "$DB" "CREATE TABLE failed(org TEXT, from_ms INTEGER, to_ms INTEGER, at TEXT)"
     [[ -s "$OUT/failed.csv" ]] && sqlite3 "$DB" ".mode csv" ".import '$OUT/failed.csv' failed"
     # a failed leaf only matters if no later (resumed) chunk covers it
@@ -100,14 +106,14 @@ SQL
         echo "Dialogs created per month (by Id time). 'alle' excludes migrated correspondence,"
         echo "which is listed separately because its Id time is the migration time, not CreatedAt."
         sqlite3 -header -column "$DB" "
-SELECT strftime('%Y-%m', from_ms/1000, 'unixepoch')                                         AS month,
+SELECT strftime('%Y-%m', from_ms/1000 + 7200, 'unixepoch')                                  AS month,
        sum(CASE WHEN service_resource NOT LIKE '%migratedcorrespondence%' THEN n ELSE 0 END) AS alle,
        sum(CASE WHEN service_resource GLOB '*_a2-*'                        THEN n ELSE 0 END) AS a2_skjema,
        sum(CASE WHEN service_resource LIKE '%migratedcorrespondence%'      THEN n ELSE 0 END) AS migrert_korrespondanse
 FROM r GROUP BY 1 ORDER BY 1;"
     else
-        echo "Dialogs in the database with CreatedAt in the month (UTC), all resources, migrated data included:"
-        sqlite3 -header -column "$DB" "SELECT strftime('%Y-%m', from_ms/1000, 'unixepoch') AS month, sum(n) AS dialogs, count(DISTINCT org) AS orgs FROM r GROUP BY 1 ORDER BY 1;"
+        echo "Dialogs in the database with CreatedAt in the month ($TZ_NAME), all resources, migrated data included:"
+        sqlite3 -header -column "$DB" "SELECT strftime('%Y-%m', from_ms/1000 + 7200, 'unixepoch') AS month, sum(n) AS dialogs, count(DISTINCT org) AS orgs FROM r GROUP BY 1 ORDER BY 1;"
         echo
         echo "Top orgs over the whole range:"
         sqlite3 -header -column "$DB" "SELECT org, sum(n) AS dialogs FROM r GROUP BY 1 ORDER BY 2 DESC LIMIT 10;"
@@ -172,11 +178,18 @@ run_chunk() {
 }
 
 covered() { grep -q "^$CUR_ORG,$1,$2," "$OUT/coverage.csv"; }
+# Any recorded chunk for this org overlapping [lo,hi)? Then a previous run already
+# split this interval; never re-run the parent (that would double count), recurse instead.
+overlaps() { awk -F, -v o="$CUR_ORG" -v lo="$1" -v hi="$2" '$1==o && $2+0<hi+0 && $3+0>lo+0 {f=1} END{exit !f}' "$OUT/coverage.csv"; }
 
 # Recursive: try the interval, split on timeout.
 walk() {
     local lo=$1 hi=$2 t0 t1 rc
     if covered "$lo" "$hi"; then return 0; fi
+    if overlaps "$lo" "$hi"; then
+        local mid=$(( lo + (hi - lo) / 2 ))
+        walk "$lo" "$mid"; walk "$mid" "$hi"; return 0
+    fi
     t0=$(date +%s.%N)
     rc=0; run_chunk "$lo" "$hi" || rc=$?
     t1=$(date +%s.%N)
@@ -208,7 +221,7 @@ if [[ "$MODE" == createdat ]]; then
     echo "$(echo "$ORGS" | wc -l | tr -d ' ') orgs"
     cur=$FROM_MS
     while (( cur < TO_MS )); do
-        nxt=$(python3 -c "import datetime as d; t=d.datetime.fromtimestamp($cur/1000,d.timezone.utc); m=(t.replace(day=1)+d.timedelta(days=32)).replace(day=1,hour=0,minute=0,second=0,microsecond=0); print(min(int(m.timestamp()*1000),$TO_MS))")
+        nxt=$(python3 -c "import datetime as d,zoneinfo; z=zoneinfo.ZoneInfo('$TZ_NAME'); t=d.datetime.fromtimestamp($cur/1000,z); m=(t.replace(day=1)+d.timedelta(days=32)).replace(day=1,hour=0,minute=0,second=0,microsecond=0); print(min(int(m.timestamp()*1000),$TO_MS))")
         for CUR_ORG in $ORGS; do walk "$cur" "$nxt"; done
         cur=$nxt
     done
