@@ -201,10 +201,10 @@ walk() {
     elif [[ $rc -eq 3 ]]; then
         if (( hi - lo <= MIN_CHUNK_MS )); then
             echo "$CUR_ORG,$lo,$hi,$(fmt_ms "$lo")" >> "$OUT/failed.csv"
-            printf '  FAIL %s -> %s  timed out even at minimum chunk\n' "$(fmt_ms "$lo")" "$(fmt_ms "$hi")"
+            printf '  FAIL  %-7s %s -> %s  timed out even at minimum chunk\n' "$CUR_ORG" "$(fmt_ms "$lo")" "$(fmt_ms "$hi")"
             return 0
         fi
-        printf '  split %s -> %s  (timeout)\n' "$(fmt_ms "$lo")" "$(fmt_ms "$hi")"
+        printf '  split %-7s %s -> %s  (timeout)\n' "$CUR_ORG" "$(fmt_ms "$lo")" "$(fmt_ms "$hi")"
         local mid=$(( lo + (hi - lo) / 2 ))
         walk "$lo" "$mid"; walk "$mid" "$hi"
     else
