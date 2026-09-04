@@ -29,7 +29,7 @@
 #
 # Usage
 #   ./dialog-created-counts.sh [--by createdat|id] ENV FROM TO [OUTDIR]
-#     ENV     test | yt01 | staging | prod   (tunnel must be up, see forward.sh)
+#     ENV     test | yt01 | staging | prod   (tunnel must be up, see ../db-access/forward.sh)
 #     FROM/TO dates on month boundaries, TO exclusive, e.g. 2024-05-01 2024-09-01
 #     OUTDIR  where results land (default ./dialog-counts-ENV-MODE)
 #   Then:
@@ -42,6 +42,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DB_ACCESS_DIR="$SCRIPT_DIR/../db-access"   # tunnel and token helpers live there
 STMT_TIMEOUT="${STMT_TIMEOUT:-15s}"   # override for testing only
 MIN_CHUNK_MS=$((2 * 60 * 1000))       # never split below 2 minutes
 START_CHUNK_MS=$((24 * 60 * 60 * 1000)) # start at one day
@@ -138,8 +139,8 @@ if [[ -s "$OUT/mode" && "$(cat "$OUT/mode")" != "$MODE" ]]; then echo "$OUT was 
 echo "$MODE" > "$OUT/mode"
 
 PORT=$(env_port "$ENV"); GROUP=$(env_group "$ENV")
-nc -z localhost "$PORT" 2>/dev/null || { echo "No tunnel on localhost:$PORT. Start it: ./forward.sh -e $ENV -t postgres" >&2; exit 1; }
-export PGPASSWORD; PGPASSWORD="$("$SCRIPT_DIR/pg-token.sh" "$ENV")"
+nc -z localhost "$PORT" 2>/dev/null || { echo "No tunnel on localhost:$PORT. Start it: $DB_ACCESS_DIR/forward.sh -e $ENV -t postgres -p $PORT --no-prompt" >&2; exit 1; }
+export PGPASSWORD; PGPASSWORD="$("$DB_ACCESS_DIR/pg-token.sh" "$ENV")"
 CONN="host=localhost port=$PORT dbname=dialogporten user=$GROUP sslmode=require"
 
 # One chunk = one psql statement. Returns 0 ok, 3 timeout, other = hard error.
@@ -201,10 +202,10 @@ walk() {
     elif [[ $rc -eq 3 ]]; then
         if (( hi - lo <= MIN_CHUNK_MS )); then
             echo "$CUR_ORG,$lo,$hi,$(fmt_ms "$lo")" >> "$OUT/failed.csv"
-            printf '  FAIL %s -> %s  timed out even at minimum chunk\n' "$(fmt_ms "$lo")" "$(fmt_ms "$hi")"
+            printf '  FAIL  %-7s %s -> %s  timed out even at minimum chunk\n' "$CUR_ORG" "$(fmt_ms "$lo")" "$(fmt_ms "$hi")"
             return 0
         fi
-        printf '  split %s -> %s  (timeout)\n' "$(fmt_ms "$lo")" "$(fmt_ms "$hi")"
+        printf '  split %-7s %s -> %s  (timeout)\n' "$CUR_ORG" "$(fmt_ms "$lo")" "$(fmt_ms "$hi")"
         local mid=$(( lo + (hi - lo) / 2 ))
         walk "$lo" "$mid"; walk "$mid" "$hi"
     else
