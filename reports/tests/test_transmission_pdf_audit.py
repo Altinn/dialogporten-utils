@@ -154,8 +154,12 @@ class AuditTests(unittest.TestCase):
         t = f.add_tx(D[6], 3); f.add_att(t, "Hovedskjema")
         # D8 no_marker with no label -> missing
         t = f.add_tx(D[7], 3, 50); f.add_att(t, "Hovedskjema")
-        for i in (0, 1, 2, 3, 4, 5):
+        for i in (0, 1, 2, 3, 5):
             f.add_label(D[i], "urn:altinn:integration:storage:5000%d/%s" % (i, uuid.uuid4()))
+        # D2: one valid plus one malformed storage label -> must stay unresolved (malformed)
+        f.add_label(D[1], "urn:altinn:integration:storage:not-a-party/nope")
+        # D5 shares D4's instance -> one execution row for two dialogs
+        f.add_label(D[4], f.labels[3][1])
         f.add_label(D[6], "urn:altinn:integration:storage:50006/%s" % uuid.uuid4())
         f.add_label(D[6], "urn:altinn:integration:storage:50007/%s" % uuid.uuid4())
         f.insert()
@@ -287,16 +291,23 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(m["candidate_transmissions"], 8)
         self.assertEqual(m["candidate_dialogs"], 7)
         self.assertEqual(m["mapped_dialogs"] + m["unresolved_dialogs"], m["candidate_dialogs"])
-        self.assertEqual(m["unresolved_by_reason"], {"missing": 1, "malformed": 0, "ambiguous": 1})
+        self.assertEqual(m["unresolved_by_reason"], {"missing": 1, "malformed": 1, "ambiguous": 1})
         with open(os.path.join(self.out, "unresolved.csv")) as f:
             unresolved = {r["dialog_id"]: r["reason"] for r in csv.DictReader(f)}
-        self.assertEqual(unresolved, {self.fx.d[6]: "ambiguous", self.fx.d[7]: "missing"})
+        self.assertEqual(unresolved, {self.fx.d[1]: "malformed", self.fx.d[6]: "ambiguous", self.fx.d[7]: "missing"})
         with open(os.path.join(self.out, "candidates.csv")) as f:
-            cands = {r["dialog_id"]: r for r in csv.DictReader(f)}
-        self.assertNotIn(self.fx.d[0], cands)  # marker dialog is not a candidate
-        self.assertEqual(cands[self.fx.d[5]]["n_candidate_tx"], "2")
-        self.assertEqual(cands[self.fx.d[1]]["party_id"], "50001")
-        self.assertEqual(len(cands), 5)
+            cands = list(csv.DictReader(f))
+        by_dialog = {d: r for r in cands for d in r["dialog_ids"].split(";")}
+        self.assertNotIn(self.fx.d[0], by_dialog)  # marker dialog is not a candidate
+        self.assertNotIn(self.fx.d[1], by_dialog)  # malformed label is not executable
+        self.assertEqual(by_dialog[self.fx.d[5]]["n_candidate_tx"], "2")
+        # D4 and D5 share one Storage instance: one execution row, both dialogs listed
+        self.assertIs(by_dialog[self.fx.d[3]], by_dialog[self.fx.d[4]])
+        self.assertEqual(by_dialog[self.fx.d[3]]["n_dialogs"], "2")
+        self.assertEqual(by_dialog[self.fx.d[3]]["party_id"], "50003")
+        self.assertEqual(len(cands), 3)
+        self.assertEqual(m["candidate_instances"], 3)
+        self.assertEqual(m["mapped_dialogs"], 4)
         # Partial export must be labelled.
         os.unlink(audit.leaf_path(self.out, 1, FROM_MS + 5 * HOUR, FROM_MS + 6 * HOUR))
         for lo in (FROM_MS + 5 * HOUR, FROM_MS + 5 * HOUR + HOUR // 2):
@@ -309,6 +320,80 @@ class AuditTests(unittest.TestCase):
             m = json.load(f)
         self.assertFalse(m["scan_complete"])
         self.assertTrue(m["scope"]["partial"])
+        run_cli("run", "--dsn", DSN, FROM, TO, self.out, "--pause", "0")  # restore coverage for later tests
+        self.assertEqual(self._load().gaps, [])
+
+    def test_07_lock_rejects_concurrent_writer(self):
+        fd = audit.acquire_lock(self.out)
+        try:
+            out = run_cli("run", "--dsn", DSN, FROM, TO, self.out, "--pause", "0", expect_rc=1)
+            self.assertIn("Refusing to write concurrently", out)
+        finally:
+            audit.release_lock(fd)
+        run_cli("run", "--dsn", DSN, FROM, TO, self.out, "--pause", "0")
+
+    def test_08_resume_refuses_different_database(self):
+        p = os.path.join(self.out, "manifest.json")
+        with open(p) as f:
+            manifest = json.load(f)
+        self.assertTrue(manifest["db_identity"].startswith("db:"))
+        original = manifest["db_identity"]
+        manifest["db_identity"] = "db:otherdb/123"
+        with open(p, "w") as f:
+            json.dump(manifest, f)
+        out = run_cli("run", "--dsn", DSN, FROM, TO, self.out, "--pause", "0", expect_rc=2)
+        self.assertIn("db_identity", out)
+        manifest["db_identity"] = original
+        with open(p, "w") as f:
+            json.dump(manifest, f)
+
+    def test_09_failed_leaf_is_retried_on_resume(self):
+        lo, hi = FROM_MS + 4 * HOUR, FROM_MS + 5 * HOUR
+        os.unlink(audit.leaf_path(self.out, 1, lo, hi))
+        with open(audit.failed_path(self.out, 1, lo, hi), "w") as f:
+            json.dump({"lo": lo, "hi": hi, "gen": 1, "at": "earlier"}, f)
+        out = run_cli("run", "--dsn", DSN, FROM, TO, self.out, "--pause", "0")
+        self.assertIn("retry", out)
+        self.assertFalse(os.path.exists(audit.failed_path(self.out, 1, lo, hi)))
+        self.assertTrue(os.path.exists(audit.leaf_path(self.out, 1, lo, hi)))
+        self.assertEqual(self._load().failed_uncovered, [])
+
+    def test_10_month_label_uses_the_instant_offset(self):
+        # 2026-01-31 23:30 Oslo (UTC+1) is 22:30 UTC; with today's summer offset (+2) it would land in February.
+        ms = int(dt.datetime(2026, 1, 31, 23, 30, tzinfo=TZ).timestamp() * 1000)
+        self.assertEqual(audit.month_label(ms, TZ), "2026-01")
+        ms = int(dt.datetime(2026, 7, 31, 23, 30, tzinfo=TZ).timestamp() * 1000)
+        self.assertEqual(audit.month_label(ms, TZ), "2026-07")
+
+    def test_11_cross_boundary_leaf_is_invalid(self):
+        p = audit.leaf_path(self.out, 3, FROM_MS, FROM_MS + 2 * HOUR)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        payload = {"lo": FROM_MS, "hi": FROM_MS + 2 * HOUR, "gen": 3, "observed_at": "x", "seconds": 0,
+                   "query_version": audit.QUERY_VERSION, "rows": []}
+        with open(p, "wb") as f:
+            f.write(gzip.compress(json.dumps(payload).encode()))
+        L = self._load()
+        self.assertTrue(any("crosses a logical interval boundary" in m for m in L.invalid), L.invalid)
+        shutil.rmtree(audit.chunk_dir(self.out, 3))
+        self.assertEqual(self._load().invalid, [])
+
+    def test_12_metadata_snapshot_is_bound_to_the_run(self):
+        p = os.path.join(self.out, "meta.csv")
+        with open(p, "w") as f:
+            f.write("resource,org,status,pdf_expected,n_pdf_types,d2_exposed,first_optional,nuget,disable_tx\n")
+            f.write("app_x_y,x,ok,True,1,False,,8.0,False\n")
+        out = run_cli("report", self.out)
+        self.assertIn("bound to this run", out)
+        with open(os.path.join(self.out, "manifest.json")) as f:
+            sha = json.load(f)["meta_sha"]
+        self.assertTrue(sha)
+        with open(p, "a") as f:
+            f.write("app_x_z,x,ok,False,0,False,,8.0,False\n")
+        out = run_cli("report", self.out, expect_rc=3)
+        self.assertIn("differs from the snapshot bound", out)
+        run_cli("fetch-meta", self.out, expect_rc=2)  # refuses to overwrite without --force
+        out = run_cli("report", self.out, "--rebind-meta")
+        self.assertIn("rebound", out)
 
 
 if __name__ == "__main__":

@@ -54,6 +54,7 @@
 import argparse
 import csv
 import datetime as dt
+import fcntl
 import glob
 import gzip
 import hashlib
@@ -169,6 +170,12 @@ def atomic_write(path: str, data: bytes) -> None:
             os.unlink(tmp)
 
 
+def month_label(ms: int, tz: zoneinfo.ZoneInfo) -> str:
+    """Month of a UTC instant in the run's zone, using that instant's own offset,
+    so the label does not depend on the offset in force when the report runs."""
+    return dt.datetime.fromtimestamp(ms / 1000, tz).strftime("%Y-%m")
+
+
 def logical_intervals(from_ms: int, to_ms: int) -> List[Tuple[int, int]]:
     out = []
     cur = from_ms
@@ -231,6 +238,15 @@ class Db:
             return 1, [], err
         rows = [line.split("\t") for line in r.stdout.splitlines() if line]
         return 0, rows, ""
+
+    def identity(self) -> str:
+        """Stable identity of the database behind this connection, so a resume
+        cannot silently mix databases. Falls back to the DSN without password."""
+        rc, rows, _ = self.query("SELECT current_database() || '/' || (SELECT system_identifier FROM pg_control_system())")
+        if rc == 0 and rows and rows[0] and rows[0][0]:
+            return "db:" + rows[0][0]
+        redacted = " ".join(p for p in (self.dsn or "").split() if not p.lower().startswith("password="))
+        return "dsn:" + hashlib.sha256(redacted.encode()).hexdigest()[:16]
 
 
 # ----------------------------------------------------------------- chunks ---
@@ -334,7 +350,17 @@ class Runner:
         return 0
 
     def walk(self, lo: int, hi: int) -> None:
-        if (lo, hi) in self.ok_leaves or (lo, hi) in self.failed_leaves:
+        if (lo, hi) in self.ok_leaves:
+            return
+        if (lo, hi) in self.failed_leaves:
+            # A leaf that timed out at minimum size on an earlier run: retry it, and
+            # clear the failure record on success. It is never silently skipped.
+            print("  retry  %s -> %s  (failed on an earlier run)" % (fmt_ms(lo), fmt_ms(hi)))
+            if self.run_leaf(lo, hi) == 0:
+                os.unlink(failed_path(self.out, self.gen, lo, hi))
+                self.failed_leaves.remove((lo, hi))
+            else:
+                print("  FAIL   %s -> %s  still timing out at minimum chunk size" % (fmt_ms(lo), fmt_ms(hi)))
             return
         if hi - lo > self.max_chunk_ms or any(a < hi and b > lo for a, b in self.ok_leaves + self.failed_leaves):
             # Too large for the configured leaf size, or a previous run already
@@ -364,55 +390,62 @@ def load_manifest(out: str) -> Optional[dict]:
         return json.load(f)
 
 
-def acquire_lock(out: str) -> str:
-    p = os.path.join(out, "lock")
-    if os.path.exists(p):
-        try:
-            with open(p) as f:
-                pid = int(f.read().strip() or "0")
-            os.kill(pid, 0)
-            die("Another run holds %s (pid %d). Refusing to write concurrently." % (p, pid), 1)
-        except (ProcessLookupError, ValueError):
-            os.unlink(p)  # stale
-        except PermissionError:
-            die("Another run holds %s. Refusing to write concurrently." % p, 1)
-    with open(p, "w") as f:
-        f.write(str(os.getpid()))
-    return p
+def acquire_lock(out: str) -> int:
+    """Exclusive OS-level lock on OUTDIR/lock, held for the whole run. Taken
+    BEFORE the manifest is read or created, so two runs cannot both pass a
+    check and then race on the manifest or the chunk files."""
+    os.makedirs(out, exist_ok=True)
+    fd = os.open(os.path.join(out, "lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        die("Another run holds %s/lock. Refusing to write concurrently." % out, 1)
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode())
+    return fd
+
+
+def release_lock(fd: int) -> None:
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
 
 
 def cmd_run(a: argparse.Namespace) -> None:
     out = a.outdir
-    os.makedirs(out, exist_ok=True)
-    manifest = load_manifest(out)
-    from_ms = parse_local(a.frm)
-    if from_ms % HOUR_MS != 0:
-        die("FROM must be on a whole hour (UTC), got %s" % a.frm)
-    to_ms = parse_local(a.to)
-    if manifest is None:
-        manifest = {
-            "schema": 1, "script_version": SCRIPT_VERSION, "env": a.env or "dsn", "dsn": a.dsn,
-            "from_ms": from_ms, "to_ms": to_ms, "from": fmt_ms(from_ms), "to": fmt_ms(to_ms),
-            "tz": TZ_NAME, "query_version": QUERY_VERSION, "created_at": utc_iso(),
-            "period_boundary_ms": int(PERIOD_BOUNDARY.timestamp() * 1000),
-        }
-        atomic_write(os.path.join(out, "manifest.json"), json.dumps(manifest, indent=1).encode())
-        print("New run. TO frozen at %s (%s)." % (fmt_ms(to_ms), TZ_NAME))
-    else:
-        mism = [k for k, v in (("env", a.env or "dsn"), ("query_version", QUERY_VERSION)) if manifest.get(k) != v]
-        if manifest["from_ms"] != from_ms:
-            mism.append("from")
-        if a.to != "now" and manifest["to_ms"] != to_ms:
-            mism.append("to")
-        if mism:
-            die("Resume refused: %s differ from manifest in %s. Use another OUTDIR." % (", ".join(mism), out))
-        to_ms = manifest["to_ms"]
-        print("Resuming run created %s, TO frozen at %s." % (manifest["created_at"], fmt_ms(to_ms)))
-
-    db = Db(a.env, a.dsn)
     lock = acquire_lock(out)
     try:
+        db = Db(a.env, a.dsn)
+        db_identity = db.identity()
+        manifest = load_manifest(out)
+        from_ms = parse_local(a.frm)
+        if from_ms % HOUR_MS != 0:
+            die("FROM must be on a whole hour (UTC), got %s" % a.frm)
+        to_ms = parse_local(a.to)
+        if manifest is None:
+            manifest = {
+                "schema": 2, "script_version": SCRIPT_VERSION, "env": a.env or "dsn", "dsn": a.dsn, "db_identity": db_identity,
+                "from_ms": from_ms, "to_ms": to_ms, "from": fmt_ms(from_ms), "to": fmt_ms(to_ms),
+                "tz": TZ_NAME, "query_version": QUERY_VERSION, "created_at": utc_iso(),
+                "period_boundary_ms": int(PERIOD_BOUNDARY.timestamp() * 1000), "meta_sha": None,
+            }
+            atomic_write(os.path.join(out, "manifest.json"), json.dumps(manifest, indent=1).encode())
+            print("New run against %s. TO frozen at %s (%s)." % (db_identity, fmt_ms(to_ms), TZ_NAME))
+        else:
+            mism = [k for k, v in (("env", a.env or "dsn"), ("query_version", QUERY_VERSION), ("db_identity", db_identity), ("tz", TZ_NAME))
+                    if manifest.get(k) != v]
+            if manifest["from_ms"] != from_ms:
+                mism.append("from")
+            if a.to != "now" and manifest["to_ms"] != to_ms:
+                mism.append("to")
+            if mism:
+                die("Resume refused: %s differ from manifest in %s. Use another OUTDIR." % (", ".join(mism), out))
+            to_ms = manifest["to_ms"]
+            print("Resuming run created %s against %s, TO frozen at %s." % (manifest["created_at"], db_identity, fmt_ms(to_ms)))
+
         gen = a.gen
+        if a.max_chunk_ms > HOUR_MS:
+            die("--max-chunk-ms must not exceed one hour: leaves must lie within one logical interval")
         intervals = logical_intervals(from_ms, to_ms)
         if a.rescan_days:
             # Re-scan only the last N days before TO, as a new generation.
@@ -435,8 +468,7 @@ def cmd_run(a: argparse.Namespace) -> None:
                 print("progress: %d/%d intervals, up to %s" % (done, len(intervals), fmt_ms(hi)))
         print("Done. Next: %s report %s" % (sys.argv[0], out))
     finally:
-        if os.path.exists(lock):
-            os.unlink(lock)
+        release_lock(lock)
 
 
 def cmd_explain(a: argparse.Namespace) -> None:
@@ -500,6 +532,8 @@ def cmd_fetch_meta(a: argparse.Namespace) -> None:
         return row
 
     fields = ["resource", "org", "status", "pdf_expected", "n_pdf_types", "d2_exposed", "first_optional", "nuget", "disable_tx"]
+    if os.path.exists(os.path.join(out, "meta.csv")) and not a.force:
+        die("%s/meta.csv exists. A run binds to the metadata snapshot it first used; pass --force to replace it (report/export will then need --rebind-meta)." % out)
     with ThreadPoolExecutor(max_workers=8) as ex:
         rows = list(ex.map(one, apps))
     rows.sort(key=lambda r: r["resource"])
@@ -515,12 +549,24 @@ def cmd_fetch_meta(a: argparse.Namespace) -> None:
     print("meta.csv written: %s" % json.dumps(summary))
 
 
-def load_meta(out: str) -> Dict[str, dict]:
+def load_meta(out: str, manifest: dict, rebind: bool = False) -> Dict[str, dict]:
+    """Load meta.csv and bind its hash to the run manifest on first use. A later
+    load with different metadata is refused unless --rebind-meta is given, so a
+    report or export cannot silently change with whatever was fetched last."""
     p = os.path.join(out, "meta.csv")
     if not os.path.exists(p):
         return {}
-    with open(p) as f:
-        return {r["resource"]: r for r in csv.DictReader(f)}
+    with open(p, "rb") as f:
+        data = f.read()
+    sha = hashlib.sha256(data).hexdigest()[:12]
+    bound = manifest.get("meta_sha")
+    if bound is None or rebind:
+        manifest["meta_sha"] = sha
+        atomic_write(os.path.join(out, "manifest.json"), json.dumps(manifest, indent=1).encode())
+        print("Metadata snapshot %s %s to this run." % (sha, "rebound" if bound else "bound"))
+    elif bound != sha:
+        die("meta.csv (sha %s) differs from the snapshot bound to this run (%s). Restore it or pass --rebind-meta deliberately." % (sha, bound), 3)
+    return {r["resource"]: r for r in csv.DictReader(data.decode().splitlines())}
 
 
 def app_group(resource: str, meta: Dict[str, dict]) -> str:
@@ -552,18 +598,28 @@ def load(out: str, manifest: dict) -> Loaded:
     con = L.con
     con.executescript("""
     CREATE TABLE rows(tx_id TEXT PRIMARY KEY, dialog_id TEXT, org TEXT, resource TEXT, deleted INTEGER,
-                      sender_created_at TEXT, n_att INTEGER, cls TEXT, tx_ms INTEGER,
+                      sender_created_at TEXT, n_att INTEGER, cls TEXT, tx_ms INTEGER, month TEXT,
                       lo INTEGER, hi INTEGER, gen INTEGER, observed_at TEXT);
     CREATE TABLE coverage(gen INTEGER, lo INTEGER, hi INTEGER, seconds REAL, observed_at TEXT, n INTEGER);
     CREATE INDEX ix_rows_dialog ON rows(dialog_id);
     CREATE INDEX ix_rows_res ON rows(resource);
     """)
+    tz = zoneinfo.ZoneInfo(manifest.get("tz", TZ_NAME))
     gens = list_gens(out)
     if not gens:
         L.invalid.append("no chunk files under %s/chunks" % out)
         return L
     leaves = {g: list_leaves(out, g) for g in gens}
     intervals = logical_intervals(manifest["from_ms"], manifest["to_ms"])
+    # Every leaf must lie wholly inside one logical interval and inside the run's
+    # bounds. A leaf crossing a boundary can neither be selected nor counted as
+    # coverage, so it is invalid data, never a silent omission.
+    for g in gens:
+        for a, b in leaves[g][0] + leaves[g][1]:
+            if b <= a or not any(lo <= a and b <= hi for lo, hi in intervals):
+                L.invalid.append("leaf gen%d [%d,%d) crosses a logical interval boundary or the run bounds" % (g, a, b))
+    if L.invalid:
+        return L
     chosen: List[Tuple[int, int, int, List[Tuple[int, int]]]] = []
     for lo, hi in intervals:
         pick = None
@@ -574,23 +630,22 @@ def load(out: str, manifest: dict) -> Loaded:
         if pick is None:
             # No generation tiles the interval: keep the one with the most coverage
             # (lowest gen on ties), never mixing generations, and record the gaps.
-            best = max(gens, key=lambda g: (covered_ms(leaves[g][0], lo, hi), -g))
-            pick = best
-            inside = sorted(l for l in leaves[pick][0] if l[0] < hi and l[1] > lo)
-            cur = lo
-            for a, b in inside:
-                if a > cur:
-                    L.gaps.append((cur, a))
-                cur = max(cur, b)
-            if cur < hi:
-                L.gaps.append((cur, hi))
+            pick = max(gens, key=lambda g: (covered_ms(leaves[g][0], lo, hi), -g))
             for a, b in leaves[pick][1]:
                 if a < hi and b > lo:
                     L.failed_uncovered.append((pick, a, b))
+        # Completeness is judged on exactly the leaves that will be loaded.
         inside = sorted(l for l in leaves[pick][0] if l[0] >= lo and l[1] <= hi)
         for (a1, b1), (a2, b2) in zip(inside, inside[1:]):
             if a2 < b1:
                 L.invalid.append("overlapping selected leaves in gen %d: [%d,%d) and [%d,%d)" % (pick, a1, b1, a2, b2))
+        cur = lo
+        for a, b in inside:
+            if a > cur:
+                L.gaps.append((cur, a))
+            cur = max(cur, b)
+        if cur < hi:
+            L.gaps.append((cur, hi))
         chosen.append((pick, lo, hi, inside))
         L.selected.append((pick, lo, hi))
 
@@ -619,22 +674,16 @@ def load(out: str, manifest: dict) -> Loaded:
                 if not (a <= ms < b):
                     L.invalid.append("row %s in %s lies outside its chunk bounds" % (r[0], p))
                     continue
+                month = month_label(ms, tz)
                 try:
-                    con.execute("INSERT INTO rows VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                (r[0], r[1], r[2], r[3], 1 if r[4] == "t" else 0, r[5] or None, int(r[6]), r[7], ms,
+                    con.execute("INSERT INTO rows VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                (r[0], r[1], r[2], r[3], 1 if r[4] == "t" else 0, r[5] or None, int(r[6]), r[7], ms, month,
                                  a, b, gen, payload.get("observed_at")))
                     L.n_rows += 1
                 except sqlite3.IntegrityError:
                     L.invalid.append("duplicate transmission id %s (in %s)" % (r[0], p))
     con.commit()
     return L
-
-
-def month_expr() -> str:
-    # tx_ms is UTC; month labels in the report zone. Interval grid is hourly,
-    # and Oslo month boundaries are whole UTC hours, so per-row labelling is exact.
-    off = int(dt.datetime.now(TZ).utcoffset().total_seconds())
-    return "strftime('%%Y-%%m', (tx_ms/1000 + %d), 'unixepoch')" % off
 
 
 def print_table(rows: List[Tuple], header: List[str]) -> None:
@@ -649,7 +698,7 @@ def cmd_report(a: argparse.Namespace) -> None:
     manifest = load_manifest(out)
     if manifest is None:
         die("No manifest in %s" % out)
-    meta = load_meta(out)
+    meta = load_meta(out, manifest, a.rebind_meta)
     L = load(out, manifest)
     con = L.con
     print("Run %s .. %s on %s, query %s, %d rows loaded from %d selected intervals"
@@ -700,9 +749,9 @@ def cmd_report(a: argparse.Namespace) -> None:
     print_table(rows, ["period", "tx", "dialogs", "candidate tx", "candidate dialogs", "empty", "no_marker", "pdf_unknown", "no_pdf_url"])
 
     print("\n== a3_pdf apps per month (%s), not deleted ==" % TZ_NAME)
-    rows = con.execute("""SELECT %s AS m, count(*), count(DISTINCT dialog_id), sum(cls!='marker'),
+    rows = con.execute("""SELECT month, count(*), count(DISTINCT dialog_id), sum(cls!='marker'),
         count(DISTINCT CASE WHEN cls!='marker' THEN dialog_id END), sum(cls='empty'), sum(cls='no_marker'), sum(cls='pdf_unknown'), sum(cls='no_pdf_url')
-        FROM r WHERE grp='a3_pdf' AND deleted=0 GROUP BY 1 ORDER BY 1""" % month_expr()).fetchall()
+        FROM r WHERE grp='a3_pdf' AND deleted=0 GROUP BY 1 ORDER BY 1""").fetchall()
     print_table(rows, ["month", "tx", "dialogs", "candidate tx", "candidate dialogs", "empty", "no_marker", "pdf_unknown", "no_pdf_url"])
 
     print("\n== Top apps by candidate transmissions (all groups) ==")
@@ -730,7 +779,7 @@ def cmd_export(a: argparse.Namespace) -> None:
     manifest = load_manifest(out)
     if manifest is None:
         die("No manifest in %s" % out)
-    meta = load_meta(out)
+    meta = load_meta(out, manifest, a.rebind_meta)
     L = load(out, manifest)
     if L.invalid:
         die("INVALID DATA, export refused: %s" % "; ".join(L.invalid[:5]), 3)
@@ -760,6 +809,8 @@ def cmd_export(a: argparse.Namespace) -> None:
             labels.setdefault(did, []).append(val)
         time.sleep(0.2)
 
+    # A dialog is mapped only when it has storage labels and ALL of them parse to
+    # the same (partyId, instanceGuid). Anything else is unresolved with a reason.
     mapped: Dict[str, Tuple[str, str]] = {}
     unresolved: List[Tuple[str, str, str]] = []
     for d in dialogs:
@@ -774,7 +825,7 @@ def cmd_export(a: argparse.Namespace) -> None:
                 bad.append(v)
         if not vals:
             unresolved.append((d, "missing", ""))
-        elif bad and not parsed:
+        elif bad:
             unresolved.append((d, "malformed", "|".join(vals)))
         elif len(parsed) > 1:
             unresolved.append((d, "ambiguous", "|".join(vals)))
@@ -793,13 +844,20 @@ def cmd_export(a: argparse.Namespace) -> None:
             buf.append(",".join('"%s"' % str(v).replace('"', '""') if ("," in str(v) or '"' in str(v)) else str(v) for v in r))
         atomic_write(path, ("\n".join(buf) + "\n").encode())
 
+    # Execution rows are per Storage INSTANCE. Several dialogs can map to one
+    # instance; they are grouped, and every dialog and transmission stays in the
+    # evidence file.
+    by_instance: Dict[Tuple[str, str], List[str]] = {}
+    for d, key in mapped.items():
+        by_instance.setdefault(key, []).append(d)
     cand_rows = []
-    for d, (party, guid) in sorted(mapped.items()):
-        txs = by_dialog[d]
-        cand_rows.append([d, party, guid, txs[0][2], txs[0][3].replace("urn:altinn:resource:", ""), app_group(txs[0][3], meta),
-                          txs[0][10], len(txs), ";".join(sorted({t[4] for t in txs})), utc_iso(min(t[7] for t in txs))])
+    for (party, guid), ds in sorted(by_instance.items()):
+        txs = [t for d in sorted(ds) for t in by_dialog[d]]
+        cand_rows.append([party, guid, ";".join(sorted(ds)), len(ds), txs[0][2], txs[0][3].replace("urn:altinn:resource:", ""),
+                          app_group(txs[0][3], meta), int(any(t[10] for t in txs)), len(txs),
+                          ";".join(sorted({t[4] for t in txs})), utc_iso(min(t[7] for t in txs))])
     w(os.path.join(out, "candidates.csv"),
-      ["dialog_id", "party_id", "instance_guid", "org", "app", "app_group", "deleted", "n_candidate_tx", "classes", "first_tx_time_utc"], cand_rows)
+      ["party_id", "instance_guid", "dialog_ids", "n_dialogs", "org", "app", "app_group", "deleted", "n_candidate_tx", "classes", "first_tx_time_utc"], cand_rows)
     w(os.path.join(out, "candidate_transmissions.csv"),
       ["tx_id", "dialog_id", "org", "app", "class", "n_attachments", "sender_created_at", "tx_time_utc", "observed_at", "gen", "deleted"],
       [[r[0], r[1], r[2], r[3].replace("urn:altinn:resource:", ""), r[4], r[5], r[6] or "", utc_iso(r[7]), r[8], r[9], r[10]] for r in cand_tx])
@@ -809,7 +867,7 @@ def cmd_export(a: argparse.Namespace) -> None:
         "exported_at": utc_iso(), "run": {k: manifest[k] for k in ("env", "from", "to", "query_version", "created_at")},
         "scan_complete": complete, "all_candidates_mapped": not unresolved, "scope": scope,
         "candidate_transmissions": len(cand_tx), "candidate_dialogs": len(dialogs), "mapped_dialogs": len(mapped),
-        "unresolved_dialogs": len(unresolved), "unresolved_by_reason": {k: sum(1 for u in unresolved if u[1] == k) for k in ("missing", "malformed", "ambiguous")},
+        "candidate_instances": len(cand_rows), "unresolved_dialogs": len(unresolved), "unresolved_by_reason": {k: sum(1 for u in unresolved if u[1] == k) for k in ("missing", "malformed", "ambiguous")},
         "meta_snapshot": json.load(open(meta_p)) if os.path.exists(meta_p) else None,
         "generations_selected": sorted({g for g, _, _ in L.selected}),
     }
@@ -845,10 +903,12 @@ def main() -> None:
 
     m = sub.add_parser("fetch-meta", help="fetch app metadata into OUTDIR/meta.csv")
     m.add_argument("outdir")
+    m.add_argument("--force", action="store_true", help="replace an existing meta.csv")
     m.set_defaults(fn=cmd_fetch_meta)
 
     rp = sub.add_parser("report", help="integrity checks and counts")
     rp.add_argument("outdir")
+    rp.add_argument("--rebind-meta", action="store_true", help="bind the current meta.csv to the run even if a different snapshot was bound")
     rp.set_defaults(fn=cmd_report)
 
     x = sub.add_parser("export", help="backfill candidate list with Storage ids")
@@ -858,6 +918,7 @@ def main() -> None:
     x.add_argument("--allow-partial", action="store_true", help="export even with coverage gaps (labelled partial)")
     x.add_argument("--exclude-no-pdf-apps", action="store_true", help="drop apps whose CURRENT metadata has no PDF-generating type (recorded in export_manifest)")
     x.add_argument("--include-deleted", action="store_true", help="include transmissions of deleted dialogs")
+    x.add_argument("--rebind-meta", action="store_true", help="bind the current meta.csv to the run even if a different snapshot was bound")
     x.add_argument("--batch", type=int, default=500)
     x.set_defaults(fn=cmd_export)
 
