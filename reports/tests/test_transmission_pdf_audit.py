@@ -394,6 +394,34 @@ class AuditTests(unittest.TestCase):
         run_cli("fetch-meta", self.out, expect_rc=2)  # refuses to overwrite without --force
         out = run_cli("report", self.out, "--rebind-meta")
         self.assertIn("rebound", out)
+        # A bound snapshot that has gone missing must not silently degrade to "no metadata".
+        os.rename(p, p + ".bak")
+        out = run_cli("report", self.out, expect_rc=3)
+        self.assertIn("meta.csv is missing but snapshot", out)
+        run_cli("export", self.out, "--dsn", DSN, expect_rc=3)
+        out = run_cli("report", self.out, "--rebind-meta")
+        self.assertIn("binding", out)
+        with open(os.path.join(self.out, "manifest.json")) as f:
+            self.assertIsNone(json.load(f)["meta_sha"])
+        os.rename(p + ".bak", p)
+        run_cli("report", self.out)  # unbound run binds the restored file again
+
+    def test_13_export_refuses_a_different_database(self):
+        p = os.path.join(self.out, "manifest.json")
+        with open(p) as f:
+            manifest = json.load(f)
+        original = manifest["db_identity"]
+        manifest["db_identity"] = "db:otherdb/123"
+        with open(p, "w") as f:
+            json.dump(manifest, f)
+        try:
+            out = run_cli("export", self.out, "--dsn", DSN, expect_rc=3)
+            self.assertIn("Label lookup refused", out)
+        finally:
+            manifest["db_identity"] = original
+            with open(p, "w") as f:
+                json.dump(manifest, f)
+        run_cli("export", self.out, "--dsn", DSN)
 
 
 if __name__ == "__main__":

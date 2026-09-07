@@ -554,12 +554,18 @@ def load_meta(out: str, manifest: dict, rebind: bool = False) -> Dict[str, dict]
     load with different metadata is refused unless --rebind-meta is given, so a
     report or export cannot silently change with whatever was fetched last."""
     p = os.path.join(out, "meta.csv")
+    bound = manifest.get("meta_sha")
     if not os.path.exists(p):
+        if bound is not None and not rebind:
+            die("meta.csv is missing but snapshot %s is bound to this run. Restore it, or pass --rebind-meta to continue deliberately without metadata." % bound, 3)
+        if bound is not None and rebind:
+            manifest["meta_sha"] = None
+            atomic_write(os.path.join(out, "manifest.json"), json.dumps(manifest, indent=1).encode())
+            print("Metadata binding %s removed from this run; app grouping unavailable." % bound)
         return {}
     with open(p, "rb") as f:
         data = f.read()
     sha = hashlib.sha256(data).hexdigest()[:12]
-    bound = manifest.get("meta_sha")
     if bound is None or rebind:
         manifest["meta_sha"] = sha
         atomic_write(os.path.join(out, "manifest.json"), json.dumps(manifest, indent=1).encode())
@@ -799,6 +805,11 @@ def cmd_export(a: argparse.Namespace) -> None:
     print("%d candidate transmissions in %d distinct dialogs. Looking up storage labels in batches of %d..." % (len(cand_tx), len(dialogs), a.batch))
 
     db = Db(a.env, a.dsn)
+    # The labels must come from the database that was audited; an --env/--dsn
+    # override pointing elsewhere would produce wrong mappings or false "missing".
+    ident = db.identity()
+    if manifest.get("db_identity") and ident != manifest["db_identity"]:
+        die("Label lookup refused: connected to %s but the audit ran against %s." % (ident, manifest["db_identity"]), 3)
     labels: Dict[str, List[str]] = {d: [] for d in dialogs}
     for i in range(0, len(dialogs), a.batch):
         batch = dialogs[i:i + a.batch]
