@@ -889,6 +889,12 @@ def cmd_export(a: argparse.Namespace) -> None:
 
 # ------------------------------------------------------------------- main ---
 def main() -> None:
+    # Progress lines must reach a pipe (tee, a log file) as they happen, not in
+    # 8 KB bursts when stdout is not a terminal.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
     p = argparse.ArgumentParser(description=__doc__ or "transmission PDF audit")
     sub = p.add_subparsers(dest="cmd", required=True)
 
