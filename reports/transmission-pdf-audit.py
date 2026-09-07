@@ -76,7 +76,7 @@ DB_ACCESS_DIR = os.path.join(SCRIPT_DIR, "..", "db-access")
 STMT_TIMEOUT = os.environ.get("STMT_TIMEOUT", "15s")
 HOUR_MS = 3600 * 1000
 MIN_CHUNK_MS = 5 * 60 * 1000
-TOKEN_TTL_S = 40 * 60
+TOKEN_TTL_S = 15 * 60  # re-ask pg-token.sh often; the server-side rejection path refreshes too
 TZ_NAME = os.environ.get("TZ_NAME", "Europe/Oslo")
 TZ = zoneinfo.ZoneInfo(TZ_NAME)
 CLASSES = ("empty", "marker", "no_marker", "pdf_unknown", "no_pdf_url")
@@ -233,11 +233,29 @@ class Db:
             err = r.stderr
             if "statement timeout" in err:
                 return 3, [], err
-            if "password authentication failed" in err or "isn't a member" in err or "Entra" in err:
+            if ("password authentication failed" in err or "isn't a member" in err or "Entra" in err
+                    or "token has expired" in err or "Acquire a new token" in err):
                 return 4, [], err
             return 1, [], err
         rows = [line.split("\t") for line in r.stdout.splitlines() if line]
         return 0, rows, ""
+
+    def invalidate_token(self) -> None:
+        """Force pg-token.sh to be consulted again. The Azure CLI hands back its
+        cached token until it is close to expiry, so a time-based refresh alone
+        can return a token with only minutes left."""
+        self._token = None
+        self._token_at = 0.0
+
+    def query_with_reauth(self, sql: str, timeout: str = STMT_TIMEOUT) -> Tuple[int, List[List[str]], str]:
+        """query(), retried once with a fresh token when the server rejects the
+        current one. Returns rc 4 only if the fresh token is rejected too."""
+        rc, rows, err = self.query(sql, timeout)
+        if rc == 4:
+            print("  token  rejected by the server, acquiring a fresh one and retrying")
+            self.invalidate_token()
+            rc, rows, err = self.query(sql, timeout)
+        return rc, rows, err
 
     def identity(self) -> str:
         """Stable identity of the database behind this connection, so a resume
@@ -321,10 +339,10 @@ class Runner:
 
     def run_leaf(self, lo: int, hi: int) -> int:
         t0 = time.time()
-        rc, rows, err = self.db.query(CHUNK_SQL.format(lo=uuid7_lower(lo), hi=uuid7_lower(hi)))
+        rc, rows, err = self.db.query_with_reauth(CHUNK_SQL.format(lo=uuid7_lower(lo), hi=uuid7_lower(hi)))
         seconds = time.time() - t0
         if rc == 4:
-            die("Database authentication failed (PIM activation expired?):\n%s" % err.strip(), 1)
+            die("Database authentication failed even with a fresh token (PIM activation expired?):\n%s" % err.strip(), 1)
         if rc == 1:
             die("Hard error from the database, aborting:\n%s" % err.strip(), 1)
         if rc == 3:
@@ -813,7 +831,7 @@ def cmd_export(a: argparse.Namespace) -> None:
     labels: Dict[str, List[str]] = {d: [] for d in dialogs}
     for i in range(0, len(dialogs), a.batch):
         batch = dialogs[i:i + a.batch]
-        rc, rows, err = db.query(LABEL_SQL.format(ids=",".join(batch)))
+        rc, rows, err = db.query_with_reauth(LABEL_SQL.format(ids=",".join(batch)))
         if rc != 0:
             die("Label lookup failed (rc %d): %s" % (rc, err.strip()), 1)
         for did, val in rows:
