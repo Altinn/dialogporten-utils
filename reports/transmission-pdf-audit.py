@@ -413,7 +413,7 @@ def acquire_lock(out: str) -> int:
     BEFORE the manifest is read or created, so two runs cannot both pass a
     check and then race on the manifest or the chunk files."""
     os.makedirs(out, exist_ok=True)
-    fd = os.open(os.path.join(out, "lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    fd = os.open(os.path.join(out, "lock"), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
