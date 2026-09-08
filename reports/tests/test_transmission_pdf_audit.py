@@ -406,7 +406,44 @@ class AuditTests(unittest.TestCase):
         os.rename(p + ".bak", p)
         run_cli("report", self.out)  # unbound run binds the restored file again
 
-    def test_13_export_refuses_a_different_database(self):
+    def test_13_export_scope_filters_match_direct_counts(self):
+        def export(*args):
+            run_cli("export", self.out, "--dsn", DSN, *args)
+            with open(os.path.join(self.out, "export_manifest.json")) as f:
+                return json.load(f)
+
+        # Fixture resources are not app_* resources, so every row is in group non_app.
+        m = export("--groups", "non_app")
+        self.assertEqual(m["candidate_transmissions"], 8)
+        self.assertEqual(m["scope"]["groups"], ["non_app"])
+        m = export("--groups", "a3_pdf")
+        self.assertEqual(m["candidate_transmissions"], 0)
+        self.assertEqual(m["candidate_dialogs"], 0)
+        self.assertEqual(m["mapped_dialogs"] + m["unresolved_dialogs"], 0)
+        run_cli("export", self.out, "--dsn", DSN, "--groups", "nonsense", expect_rc=2)
+        # Classes: empty are D3 (hour 1) and D6's second transmission (hour 4).
+        m = export("--classes", "empty")
+        self.assertEqual(m["candidate_transmissions"], 2)
+        self.assertEqual(m["candidate_dialogs"], 2)
+        self.assertEqual(m["scope"]["classes"], ["empty"])
+        run_cli("export", self.out, "--dsn", DSN, "--classes", "marker", expect_rc=2)
+        # Period: from hour 3 -> D7 (h3), D8 (h3), D6's second (h4).
+        m = export("--from", "2031-01-01T03:00")
+        self.assertEqual(m["candidate_transmissions"], 3)
+        self.assertEqual(m["scope"]["from"], "2031-01-01 03:00")
+        m = export("--from", "2031-01-01T03:00", "--to", "2031-01-01T04:00")
+        self.assertEqual(m["candidate_transmissions"], 2)
+        # Cross-check one filtered export against the loaded rows directly.
+        L = self._load()
+        direct = L.con.execute("SELECT count(*) FROM rows WHERE cls!='marker' AND deleted=0 AND tx_ms >= ? AND tx_ms < ?",
+                               (FROM_MS + 3 * HOUR, FROM_MS + 4 * HOUR)).fetchone()[0]
+        self.assertEqual(direct, 2)
+        # Unscoped export is unchanged.
+        m = export()
+        self.assertEqual(m["candidate_transmissions"], 8)
+        self.assertIsNone(m["scope"]["groups"])
+
+    def test_14_export_refuses_a_different_database(self):
         p = os.path.join(self.out, "manifest.json")
         with open(p) as f:
             manifest = json.load(f)
