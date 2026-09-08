@@ -81,6 +81,7 @@ TZ_NAME = os.environ.get("TZ_NAME", "Europe/Oslo")
 TZ = zoneinfo.ZoneInfo(TZ_NAME)
 CLASSES = ("empty", "marker", "no_marker", "pdf_unknown", "no_pdf_url")
 CANDIDATE_CLASSES = tuple(c for c in CLASSES if c != "marker")
+APP_GROUPS = ("a3_pdf", "a3_nopdf", "a2", "non_app", "unknown")
 # Adapter PR #224 reached production on 2026-06-15 (Release-184, main@7a2a1d0a).
 PERIOD_BOUNDARY = dt.datetime(2026, 6, 15, tzinfo=TZ)
 STORAGE_LABEL_RE = re.compile(
@@ -812,13 +813,47 @@ def cmd_export(a: argparse.Namespace) -> None:
         die("Coverage incomplete (%d gaps, %d failed leaves). Export refused; pass --allow-partial to export a labelled partial list." % (len(L.gaps), len(L.failed_uncovered)), 3)
     con = L.con
     con.create_function("app_group", 1, lambda r: app_group(r, meta))
-    where = "cls != 'marker'"
-    scope = {"exclude_no_pdf_apps": bool(a.exclude_no_pdf_apps), "include_deleted": bool(a.include_deleted), "partial": not complete}
+    # Scope. Marker transmissions are never candidates. Everything else is opt-in
+    # narrowing, and every narrowing is recorded in the export manifest so the list
+    # is either exhaustive or explicitly scoped, never silently cut.
+    where = ["cls != 'marker'"]
+    params: List[object] = []
+    groups = [g.strip() for g in a.groups.split(",")] if a.groups else None
+    classes = [c.strip() for c in a.classes.split(",")] if a.classes else None
+    if groups:
+        bad = [g for g in groups if g not in APP_GROUPS]
+        if bad:
+            die("Unknown group(s) %s; valid: %s" % (", ".join(bad), ", ".join(APP_GROUPS)))
+        if not meta:
+            die("--groups needs meta.csv (run fetch-meta); without metadata every app is 'unknown'")
+        where.append("app_group(resource) IN (%s)" % ",".join("?" * len(groups)))
+        params += groups
+    if classes:
+        bad = [c for c in classes if c not in CANDIDATE_CLASSES]
+        if bad:
+            die("Unknown class(es) %s; valid: %s" % (", ".join(bad), ", ".join(CANDIDATE_CLASSES)))
+        where.append("cls IN (%s)" % ",".join("?" * len(classes)))
+        params += classes
+    from_ms = parse_local(a.frm) if a.frm else None
+    to_ms = parse_local(a.to) if a.to else None
+    if from_ms is not None:
+        where.append("tx_ms >= ?")
+        params.append(from_ms)
+    if to_ms is not None:
+        where.append("tx_ms < ?")
+        params.append(to_ms)
     if a.exclude_no_pdf_apps:
-        where += " AND app_group(resource) != 'a3_nopdf'"
+        where.append("app_group(resource) != 'a3_nopdf'")
     if not a.include_deleted:
-        where += " AND deleted = 0"
-    cand_tx = con.execute("SELECT tx_id, dialog_id, org, resource, cls, n_att, sender_created_at, tx_ms, observed_at, gen, deleted FROM rows WHERE %s ORDER BY dialog_id, tx_ms" % where).fetchall()
+        where.append("deleted = 0")
+    scope = {
+        "groups": groups, "classes": classes,
+        "from": fmt_ms(from_ms) if from_ms is not None else None, "to": fmt_ms(to_ms) if to_ms is not None else None,
+        "from_ms": from_ms, "to_ms": to_ms, "tz": TZ_NAME,
+        "exclude_no_pdf_apps": bool(a.exclude_no_pdf_apps), "include_deleted": bool(a.include_deleted), "partial": not complete,
+    }
+    cand_tx = con.execute("SELECT tx_id, dialog_id, org, resource, cls, n_att, sender_created_at, tx_ms, observed_at, gen, deleted FROM rows WHERE %s ORDER BY dialog_id, tx_ms"
+                          % " AND ".join(where), params).fetchall()
     dialogs = sorted({r[1] for r in cand_tx})
     print("%d candidate transmissions in %d distinct dialogs. Looking up storage labels in batches of %d..." % (len(cand_tx), len(dialogs), a.batch))
 
@@ -951,6 +986,10 @@ def main() -> None:
     x.add_argument("--env", default=None, help="for the label lookup (defaults to the run's env)")
     x.add_argument("--dsn")
     x.add_argument("--allow-partial", action="store_true", help="export even with coverage gaps (labelled partial)")
+    x.add_argument("--groups", help="comma-separated app groups to include: %s (needs meta.csv)" % ",".join(APP_GROUPS))
+    x.add_argument("--classes", help="comma-separated classes to include: %s (marker is never exported)" % ",".join(CANDIDATE_CLASSES))
+    x.add_argument("--from", dest="frm", help="only transmissions at or after this time, ISO in %s" % TZ_NAME)
+    x.add_argument("--to", help="only transmissions before this time, ISO in %s" % TZ_NAME)
     x.add_argument("--exclude-no-pdf-apps", action="store_true", help="drop apps whose CURRENT metadata has no PDF-generating type (recorded in export_manifest)")
     x.add_argument("--include-deleted", action="store_true", help="include transmissions of deleted dialogs")
     x.add_argument("--rebind-meta", action="store_true", help="bind the current meta.csv to the run even if a different snapshot was bound")
